@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=LG Music Flow
+Comment=Control and stream music to LG Music Flow / Soundbar
+Exec=/home/esketids/.local/bin/musicflow
+Icon=musicflow
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=musicflow.exe

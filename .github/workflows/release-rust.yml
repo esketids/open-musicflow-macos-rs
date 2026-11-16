@@ -1,0 +1,109 @@
+name: Build & Publish Native Rust Releases (macOS Universal .app/.dmg, Linux, Windows)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-universal:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Apple Silicon & Intel Rust targets
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Run Rust protocol & AES-256-CBC unit tests
+        run: cargo test
+
+      - name: Build Universal macOS Binary (arm64 + x86_64 via lipo)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/universal/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/open-musicflow-rs \
+            target/x86_64-apple-darwin/release/open-musicflow-rs \
+            -output target/universal/release/open-musicflow-rs
+          file target/universal/release/open-musicflow-rs
+
+      - name: Package Open MusicFlow Studio.app (.zip & .dmg)
+        run: |
+          chmod +x scripts/package-macos-app.sh
+          ./scripts/package-macos-app.sh
+          cd release
+          ditto -c -k --sequesterRsrc --keepParent "Open MusicFlow Studio.app" open-musicflow-macos-rs-v1.0.0-universal-app.zip
+          mkdir -p dmg-stage
+          cp -R "Open MusicFlow Studio.app" dmg-stage/
+          cp "Install-to-Applications.command" dmg-stage/
+          ln -s /Applications dmg-stage/Applications
+          hdiutil create -volname "Open MusicFlow Studio" -srcfolder dmg-stage -ov -format UDZO Open-MusicFlow-Studio-v1.0.0-macOS-Universal.dmg
+          zip -r open-musicflow-macos-rs-v1.0.0-universal.zip "Open MusicFlow Studio.app" "Install-to-Applications.command"
+
+      - name: Upload macOS Universal .dmg & .zip to GitHub Release v1.0.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.0.0 \
+            release/Open-MusicFlow-Studio-v1.0.0-macOS-Universal.dmg \
+            release/open-musicflow-macos-rs-v1.0.0-universal.zip \
+            release/open-musicflow-macos-rs-v1.0.0-universal-app.zip \
+            --clobber || true
+
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Rust unit tests & build release binary
+        run: |
+          cargo test
+          cargo build --release
+          mkdir -p release/open-musicflow-rs-v1.0.0-linux-x64
+          cp target/release/open-musicflow-rs release/open-musicflow-rs-v1.0.0-linux-x64/
+          cp README.md docs-sj8-reference.md release/open-musicflow-rs-v1.0.0-linux-x64/
+          cp -r configs scripts release/open-musicflow-rs-v1.0.0-linux-x64/
+          tar -czf release/open-musicflow-rs-v1.0.0-linux-x64.tar.gz -C release open-musicflow-rs-v1.0.0-linux-x64
+          (cd release && zip -r open-musicflow-rs-v1.0.0-linux-x64.zip open-musicflow-rs-v1.0.0-linux-x64)
+
+      - name: Upload Linux x64 binary to GitHub Release v1.0.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.0.0 \
+            release/open-musicflow-rs-v1.0.0-linux-x64.tar.gz \
+            release/open-musicflow-rs-v1.0.0-linux-x64.zip \
+            --clobber || true
+
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Windows x64 native .exe
+        run: |
+          cargo test
+          cargo build --release
+          mkdir -p release/open-musicflow-rs-v1.0.0-windows-x64
+          cp target/release/open-musicflow-rs.exe release/open-musicflow-rs-v1.0.0-windows-x64/OpenMusicFlowStudio.exe
+          cp README.md docs-sj8-reference.md release/open-musicflow-rs-v1.0.0-windows-x64/
+          7z a release/open-musicflow-rs-v1.0.0-windows-x64.zip ./release/open-musicflow-rs-v1.0.0-windows-x64/*
+
+      - name: Upload Windows x64 .exe to GitHub Release v1.0.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.0.0 \
+            release/open-musicflow-rs-v1.0.0-windows-x64.zip \
+            --clobber || true

@@ -1,0 +1,17 @@
+[package]
+name = "open-musicflow-rs"
+version = "1.0.0"
+edition = "2021"
+authors = ["Open MusicFlow Contributors"]
+description = "Native Rust cleanroom implementation of LG Music Flow Studio (Controller, Wi-Fi Alarms, Spotify Connect & DMS Server) for macOS, Linux, and Windows"
+license = "MIT"
+
+[[bin]]
+name = "open-musicflow-rs"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
