@@ -97,7 +97,8 @@ jobs:
           cargo build --release
           mkdir -p release/open-musicflow-rs-v1.0.0-windows-x64
           cp target/release/open-musicflow-rs.exe release/open-musicflow-rs-v1.0.0-windows-x64/OpenMusicFlowStudio.exe
-          cp README.md docs-sj8-reference.md release/open-musicflow-rs-v1.0.0-windows-x64/
+          cp README.md release/open-musicflow-rs-v1.0.0-windows-x64/
+          cp docs-sj8-reference.md release/open-musicflow-rs-v1.0.0-windows-x64/
           7z a release/open-musicflow-rs-v1.0.0-windows-x64.zip ./release/open-musicflow-rs-v1.0.0-windows-x64/*
 
       - name: Upload Windows x64 .exe to GitHub Release v1.0.0
