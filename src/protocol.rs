@@ -302,7 +302,84 @@ impl SoundbarController {
 
     pub fn broadcast_state(&mut self) {
         let state_json = self.soundbar_state_json();
-        self.broadcast_ws("soundbar_state", &state_json);
+        self.broadcast_ws("state", &state_json);
+    }
+
+    pub fn alarms_array_json(&self) -> String {
+        let alarms_str: Vec<String> = self
+            .alarms
+            .iter()
+            .map(|a| {
+                let days_str: Vec<String> = a.days_list.iter().map(|d| d.to_string()).collect();
+                format!(
+                    r#"{{"id":{},"title":{},"hour":{},"minute":{},"daysBitmask":{},"daysList":[{}],"dayRepeat":{},"volume":{},"durationMinutes":{},"enable":{},"shuffle":{},"sourceType":{},"spotifyUri":{},"localTrackId":{},"targetInput":{},"fadeInSeconds":{},"syncedToHardware":{}}}"#,
+                    a.id,
+                    json_str(&a.title),
+                    a.hour,
+                    a.minute,
+                    a.days_bitmask,
+                    days_str.join(","),
+                    a.day_repeat,
+                    a.volume,
+                    a.duration_minutes,
+                    a.enable,
+                    a.shuffle,
+                    json_str(&a.source_type),
+                    json_str(&a.spotify_uri),
+                    json_str(&a.local_track_id),
+                    a.target_input,
+                    a.fade_in_seconds,
+                    a.synced_to_hardware
+                )
+            })
+            .collect();
+        format!("[{}]", alarms_str.join(","))
+    }
+
+    pub fn mesh_nodes_array_json(&self) -> String {
+        let mesh_str: Vec<String> = self
+            .mesh_nodes
+            .iter()
+            .map(|m| {
+                format!(
+                    r#"{{"id":{},"name":{},"ip":{},"model":{},"role":{},"channelAssignment":{},"groupId":{},"volume":{},"muted":{},"online":{},"meshRssi":{}}}"#,
+                    json_str(&m.id),
+                    json_str(&m.name),
+                    json_str(&m.ip),
+                    json_str(&m.model),
+                    json_str(&m.role),
+                    json_str(&m.channel_assignment),
+                    m.group_id,
+                    m.volume,
+                    m.muted,
+                    m.online,
+                    m.mesh_rssi
+                )
+            })
+            .collect();
+        format!("[{}]", mesh_str.join(","))
+    }
+
+    pub fn packet_logs_array_json(&self) -> String {
+        let logs_str: Vec<String> = self
+            .packet_logs
+            .iter()
+            .take(50)
+            .map(|l| {
+                format!(
+                    r#"{{"id":{},"timestamp":{},"direction":{},"encrypted":{},"cipherProfile":{},"headerHex":"10","rawByteLength":{},"msgType":{},"payload":{}}}"#,
+                    json_str(&l.id),
+                    json_str(&l.timestamp),
+                    json_str(&l.direction),
+                    l.encrypted,
+                    json_str(&l.cipher_profile),
+                    l.raw_byte_length,
+                    json_str(&l.msg_type),
+                    l.payload_json
+                )
+            })
+            .collect();
+        format!("[{}]", logs_str.join(","))
     }
 
     fn record_packet(
@@ -326,13 +403,15 @@ impl SoundbarController {
             msg_type: msg_type.to_string(),
             payload_json: payload_json.to_string(),
         };
+        let header_hex = if encrypted { "10" } else { "00" };
         let entry_json = format!(
-            r#"{{"id":{},"timestamp":{},"direction":{},"encrypted":{},"cipherProfile":{},"rawByteLength":{},"msgType":{},"payload":{}}}"#,
+            r#"{{"id":{},"timestamp":{},"direction":{},"encrypted":{},"cipherProfile":{},"headerHex":{},"rawByteLength":{},"msgType":{},"payload":{}}}"#,
             json_str(&entry.id),
             json_str(&entry.timestamp),
             json_str(&entry.direction),
             entry.encrypted,
             json_str(&entry.cipher_profile),
+            json_str(header_hex),
             entry.raw_byte_length,
             json_str(&entry.msg_type),
             entry.payload_json
@@ -341,6 +420,17 @@ impl SoundbarController {
         if self.packet_logs.len() > 80 {
             self.packet_logs.truncate(80);
         }
+        crate::logger::log_debug(
+            "TCP-9741",
+            &format!(
+                "{} {} ({}B, {}) {}",
+                direction.to_uppercase(),
+                msg_type,
+                raw_len,
+                cipher.as_str(),
+                payload_json
+            ),
+        );
         self.broadcast_ws("packet", &entry_json);
     }
 
@@ -582,76 +672,8 @@ impl SoundbarController {
     }
 
     pub fn soundbar_state_json(&self) -> String {
-        let alarms_str: Vec<String> = self
-            .alarms
-            .iter()
-            .map(|a| {
-                let days_str: Vec<String> = a.days_list.iter().map(|d| d.to_string()).collect();
-                format!(
-                    r#"{{"id":{},"title":{},"hour":{},"minute":{},"daysBitmask":{},"daysList":[{}],"dayRepeat":{},"volume":{},"durationMinutes":{},"enable":{},"shuffle":{},"sourceType":{},"spotifyUri":{},"localTrackId":{},"targetInput":{},"fadeInSeconds":{},"syncedToHardware":{}}}"#,
-                    a.id,
-                    json_str(&a.title),
-                    a.hour,
-                    a.minute,
-                    a.days_bitmask,
-                    days_str.join(","),
-                    a.day_repeat,
-                    a.volume,
-                    a.duration_minutes,
-                    a.enable,
-                    a.shuffle,
-                    json_str(&a.source_type),
-                    json_str(&a.spotify_uri),
-                    json_str(&a.local_track_id),
-                    a.target_input,
-                    a.fade_in_seconds,
-                    a.synced_to_hardware
-                )
-            })
-            .collect();
-
-        let mesh_str: Vec<String> = self
-            .mesh_nodes
-            .iter()
-            .map(|m| {
-                format!(
-                    r#"{{"id":{},"name":{},"ip":{},"model":{},"role":{},"channelAssignment":{},"groupId":{},"volume":{},"muted":{},"online":{},"meshRssi":{}}}"#,
-                    json_str(&m.id),
-                    json_str(&m.name),
-                    json_str(&m.ip),
-                    json_str(&m.model),
-                    json_str(&m.role),
-                    json_str(&m.channel_assignment),
-                    m.group_id,
-                    m.volume,
-                    m.muted,
-                    m.online,
-                    m.mesh_rssi
-                )
-            })
-            .collect();
-
-        let logs_str: Vec<String> = self
-            .packet_logs
-            .iter()
-            .take(50)
-            .map(|l| {
-                format!(
-                    r#"{{"id":{},"timestamp":{},"direction":{},"encrypted":{},"cipherProfile":{},"rawByteLength":{},"msgType":{},"payload":{}}}"#,
-                    json_str(&l.id),
-                    json_str(&l.timestamp),
-                    json_str(&l.direction),
-                    l.encrypted,
-                    json_str(&l.cipher_profile),
-                    l.raw_byte_length,
-                    json_str(&l.msg_type),
-                    l.payload_json
-                )
-            })
-            .collect();
-
         format!(
-            r#"{{"connected":{},"connecting":false,"host":{},"port":{},"dialect":{},"detectedDialect":"temescal","encryption":{},"isSimulator":{},"lastUpdated":{},"name":{},"modelName":{},"petName":{},"modelNum":14,"region":"SG","protoVer":1,"registered":true,"firmwareVersion":{},"micomVersion":{},"hdmiVersion":{},"c4aVersion":{},"macAddress":{},"btMacAddress":{},"lanMacAddress":{},"ssid":{},"rssi":{},"meshChannel":0,"networkMode":5,"miracast":"off","radioPartStatus":{},"currentFunction":{},"cpType":{},"supportedFunctions":[0,15,1,12,6,5,8,14],"customFunctionNames":{{"15":"OPTICAL/HDMI ARC"}},"volume":{},"maxVolume":{},"muted":{},"currentEq":{},"supportedEqs":[14,0,7,12,1,2,3,4,5,6,8,9,10,11,13,15,16,17,18],"bass":{},"treble":{},"balance":{},"nightMode":{},"autoVolume":{},"drc":{},"neuralX":{},"avSyncMs":{},"avSyncMin":0,"avSyncMax":300,"wooferConnected":true,"wooferLevel":{},"wooferRaw":{},"wooferOffset":{},"wooferMin":-15,"wooferMax":6,"rearConnected":false,"rearEnabled":{},"rearLevel":{},"rearMin":-6,"rearMax":6,"centerLevel":{},"topLevel":{},"tvRemote":{},"autoPower":{},"autoDisplay":{},"btStandby":{},"btRestrict":{},"ledIndicator":{},"sleepTimerMinutes":{},"playInfo":{{"title":{},"artist":{},"album":{},"sourceApp":{},"isPlaying":{},"positionSec":{},"durationSec":{},"repeat":0,"shuffle":{},"audioCodec":{}}},"alarms":[{}],"meshNodes":[{}],"packetLogs":[{}]}}"#,
+            r#"{{"connected":{},"connecting":false,"host":{},"port":{},"dialect":{},"detectedDialect":"musicflow","encryption":{},"isSimulator":{},"lastUpdated":{},"name":{},"modelName":{},"petName":{},"modelNum":14,"region":"SG","protoVer":1,"registered":true,"firmwareVersion":{},"micomVersion":{},"hdmiVersion":{},"c4aVersion":{},"macAddress":{},"bluetoothMac":{},"btMacAddress":{},"lanMacAddress":{},"ipv4Addr":"192.168.0.10","ipv6Addr":"fe80::7e1c:4eff:fe3b:b022","ssid":{},"rssi":{},"meshChannel":0,"networkMode":5,"networkType":"Wireless","miracast":"off","radioPartStatus":{},"currentFunction":{},"cpType":{},"availableFunctions":[0,15,1,12,6,5,8,14],"supportedFunctions":[0,15,1,12,6,5,8,14],"customFunctionNames":{{"15":"OPTICAL/HDMI ARC"}},"volume":{},"maxVolume":{},"muted":{},"currentEq":{},"availableEqs":[14,0,7,12],"supportedEqs":[14,0,7,12,1,2,3,4,5,6,8,9,10,11,13,15,16,17,18],"bass":{},"treble":{},"lrBalance":{},"balance":{},"nightMode":{},"autoVolume":{},"drc":{},"neuralX":{},"avSyncMs":{},"avSyncMin":0,"avSyncMax":300,"wooferConnected":true,"wooferLevel":{},"wooferRaw":{},"wooferOffset":{},"wooferMin":-15,"wooferMax":6,"rearConnected":false,"rearEnabled":{},"rearLevel":{},"rearMin":-6,"rearMax":6,"centerLevel":{},"topLevel":{},"tvRemote":{},"autoPower":{},"autoDisplay":{},"btStandby":{},"btRestrict":{},"ledIndicator":{},"limitGroupGcast":false,"enableBalance":true,"visibleToneCtrl":true,"visibleAlarm":true,"visibleReserveSleep":true,"visibleMlibSync":false,"visibleTvConn":true,"sleepTimerMinutes":{},"playInfo":{{"playing":{},"isPlaying":{},"title":{},"artist":{},"album":{},"albumArt":"","sourceApp":{},"positionSec":{},"durationSec":{},"repeat":0,"shuffle":{},"cpType":{},"audioFormat":{},"audioCodec":{}}},"alarms":{},"alarmActiveNow":false,"meshNodes":{},"packetLogs":{}}}"#,
             self.connected,
             json_str(&self.host),
             self.port,
@@ -668,6 +690,7 @@ impl SoundbarController {
             json_str(&self.c4a_version),
             json_str(&self.mac_address),
             json_str(&self.bt_mac_address),
+            json_str(&self.bt_mac_address),
             json_str(&self.lan_mac_address),
             json_str(&self.ssid),
             self.rssi,
@@ -680,6 +703,7 @@ impl SoundbarController {
             self.current_eq,
             self.bass,
             self.treble,
+            self.balance,
             self.balance,
             self.night_mode,
             self.auto_volume,
@@ -700,18 +724,21 @@ impl SoundbarController {
             self.bt_restrict,
             self.led_indicator,
             self.sleep_timer_minutes,
+            self.play_playing,
+            self.play_playing,
             json_str(&self.play_title),
             json_str(&self.play_artist),
             json_str(&self.play_album),
             json_str(&self.play_source_app),
-            self.play_playing,
             self.play_pos_sec,
             self.play_dur_sec,
             self.play_shuffle,
+            self.cp_type,
             json_str(&self.play_codec),
-            alarms_str.join(","),
-            mesh_str.join(","),
-            logs_str.join(",")
+            json_str(&self.play_codec),
+            self.alarms_array_json(),
+            self.mesh_nodes_array_json(),
+            self.packet_logs_array_json()
         )
     }
 
@@ -735,10 +762,11 @@ impl SoundbarController {
 
     pub fn full_api_state_json(&self) -> String {
         format!(
-            r#"{{"soundbar":{},"spotify":{},"tracks":{}}}"#,
+            r#"{{"soundbar":{},"spotify":{},"tracks":{},"packetLogs":{},"dmsPort":49252}}"#,
             self.soundbar_state_json(),
             self.spotify_state_json(),
-            Self::media_tracks_json()
+            Self::media_tracks_json(),
+            self.packet_logs_array_json()
         )
     }
 }

@@ -68,4 +68,24 @@ open "$TARGET_DIR/$APP_NAME"
 EOF
 chmod +x "release/Install-to-Applications.command"
 
+cat > "release/Debug-Open-MusicFlow.command" <<'EOF'
+#!/usr/bin/env bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_BIN="$DIR/Open MusicFlow Studio.app/Contents/MacOS/OpenMusicFlowStudio"
+if [ ! -x "$APP_BIN" ] && [ -x "/Applications/Open MusicFlow Studio.app/Contents/MacOS/OpenMusicFlowStudio" ]; then
+  APP_BIN="/Applications/Open MusicFlow Studio.app/Contents/MacOS/OpenMusicFlowStudio"
+fi
+echo "=================================================================="
+echo " Open MusicFlow Studio — Live Debug Console"
+echo " Debug log files:"
+echo "   - /tmp/open-musicflow-debug.log"
+echo "   - ~/Library/Logs/OpenMusicFlowStudio/debug.log"
+echo "   - http://127.0.0.1:4741/api/debug-log"
+echo "=================================================================="
+xattr -cr "$DIR/Open MusicFlow Studio.app" 2>/dev/null || true
+"$APP_BIN"
+EOF
+chmod +x "release/Debug-Open-MusicFlow.command"
+
 echo "✅ Packaged native Rust macOS bundle at: $APP_DIR"
+

@@ -1,14 +1,17 @@
 //! Open MusicFlow Studio (macOS / Linux / Windows Native Rust Edition)
 //! Single-binary zero-dependency Rust server & desktop launcher with embedded UI,
-//! FIPS-197 AES-256-CBC LG SJ8 protocol engine, RFC 6455 WebSockets, and DMS :49252 server.
+//! FIPS-197 AES-256-CBC LG SJ8 protocol engine, RFC 6455 WebSockets, DMS :49252 server,
+//! and structured debug logging (`stdout`, `/tmp/open-musicflow-debug.log`, `~/Library/Logs/OpenMusicFlowStudio/debug.log`, and `GET /api/debug-log`).
 
 mod crypto;
 mod json;
+mod logger;
 mod protocol;
 mod simulator;
 
 use crate::crypto::{days_list_to_bitmask, websocket_accept_key, EncryptionMode};
 use crate::json::{json_str, parse_json};
+use crate::logger::{debug_log_paths, get_recent_logs_text, log_debug};
 use crate::protocol::{
     connect_soundbar_tcp, discover_ssdp_multicast, encode_ws_text_frame, probe_soundbar_port,
     send_one_shot_lg_command, synthesize_wav_track, SoundbarController, WifiAlarmEntry,
@@ -48,7 +51,20 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4741);
 
+    log_debug("BOOT", "Starting Open MusicFlow Studio (Native Rust Edition v1.0.0)...");
+    for p in debug_log_paths() {
+        log_debug("BOOT", &format!("Debug log file active: {}", p.display()));
+    }
+
     let mock_port = start_mock_soundbar_server(19741);
+    log_debug(
+        "SIMULATOR",
+        &format!(
+            "Virtual LG SJ8 TCP 9741 Simulator listening on 127.0.0.1:{}",
+            mock_port
+        ),
+    );
+
     let controller = Arc::new(Mutex::new(SoundbarController::new()));
 
     // Connect to built-in Rust simulator immediately (< 2ms), then probe live LG SJ8 in background
@@ -64,7 +80,12 @@ fn main() {
     if !force_sim {
         let ctrl_probe = Arc::clone(&controller);
         thread::spawn(move || {
+            log_debug("PROBE", "Probing live LG SJ8 at 192.168.0.10:9741...");
             if probe_soundbar_port("192.168.0.10", LG_DEFAULT_TCP_PORT, 600) {
+                log_debug(
+                    "PROBE",
+                    "Live LG SJ8 detected at 192.168.0.10:9741! Connecting...",
+                );
                 connect_soundbar_tcp(
                     &ctrl_probe,
                     "192.168.0.10",
@@ -72,21 +93,54 @@ fn main() {
                     EncryptionMode::Sj8V1,
                     false,
                 );
+            } else {
+                log_debug(
+                    "PROBE",
+                    "192.168.0.10:9741 not reachable on current network; staying on built-in LG SJ8 simulator.",
+                );
             }
         });
     }
 
     // Bind main UI & REST/WebSocket server on preferred_port (4741)
     let mut api_port = preferred_port;
-    let api_listener = loop {
-        match TcpListener::bind(("0.0.0.0", api_port)) {
-            Ok(l) => break l,
-            Err(_) => api_port += 1,
+    let api_listener = match TcpListener::bind(("0.0.0.0", api_port)) {
+        Ok(l) => l,
+        Err(_) => {
+            if api_port == 4741 {
+                log_debug(
+                    "STARTUP",
+                    "Port 4741 is in use by a previous instance; terminating stale listener...",
+                );
+                #[cfg(unix)]
+                {
+                    if let Ok(out) = Command::new("lsof").args(["-ti", ":4741"]).output() {
+                        let pids = String::from_utf8_lossy(&out.stdout);
+                        for pid in pids.split_whitespace() {
+                            let _ = Command::new("kill").args(["-9", pid]).status();
+                        }
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+            loop {
+                match TcpListener::bind(("0.0.0.0", api_port)) {
+                    Ok(l) => break l,
+                    Err(_) => api_port += 1,
+                }
+            }
         }
     };
 
     // Also bind UPnP/DLNA DMS port 49252 for LG SJ8 SET_ALARM_PLAYLIST & audio streaming
     if let Ok(dms_listener) = TcpListener::bind(("0.0.0.0", LG_DMS_HTTP_PORT)) {
+        log_debug(
+            "DMS",
+            &format!(
+                "UPnP / DLNA DMS Media Server listening on http://0.0.0.0:{}/dmr.xml",
+                LG_DMS_HTTP_PORT
+            ),
+        );
         let ctrl_dms = Arc::clone(&controller);
         thread::spawn(move || {
             for stream in dms_listener.incoming().flatten() {
@@ -96,12 +150,13 @@ fn main() {
         });
     }
 
-    println!("================================================================");
-    println!("  Open MusicFlow Studio (Native Rust Edition v1.0.0)");
-    println!("  Web UI & REST/WS API : http://127.0.0.1:{}", api_port);
-    println!("  UPnP / DLNA DMS      : http://0.0.0.0:{}/dmr.xml", LG_DMS_HTTP_PORT);
-    println!("  Virtual LG SJ8 Sim   : 127.0.0.1:{} (TCP 9741 AES-256-CBC)", mock_port);
-    println!("================================================================");
+    log_debug(
+        "HTTP",
+        &format!(
+            "Web UI, REST/WS API & Debug Logs ready at http://127.0.0.1:{} (Debug logs: http://127.0.0.1:{}/api/debug-log)",
+            api_port, api_port
+        ),
+    );
 
     if !headless {
         let url = format!("http://127.0.0.1:{}", api_port);
@@ -118,6 +173,7 @@ fn main() {
 }
 
 fn open_native_desktop_window(url: &str) {
+    log_debug("UI-WINDOW", &format!("Opening desktop UI window for {}", url));
     #[cfg(target_os = "macos")]
     {
         let chrome_bin = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -204,13 +260,16 @@ fn handle_http_connection(
                 accept
             );
             if stream.write_all(handshake.as_bytes()).is_ok() {
+                let _ = stream.flush();
                 let _ = stream.set_read_timeout(None);
+                log_debug("WEBSOCKET", "Client connected to /ws");
                 if let Ok(mut guard) = controller.lock() {
                     let init_msg = format!(
                         r#"{{"type":"init","data":{}}}"#,
                         guard.full_api_state_json()
                     );
                     let _ = stream.write_all(&encode_ws_text_frame(&init_msg));
+                    let _ = stream.flush();
                     guard.add_ws_client(stream);
                 }
             }
@@ -233,6 +292,8 @@ fn handle_http_connection(
     }
     let body_str = String::from_utf8_lossy(&body_bytes).to_string();
     let body_json = parse_json(&body_str);
+
+    log_debug("HTTP", &format!("{} {}", method, raw_path));
 
     // Static & DMS Routes
     if method == "GET" || method == "HEAD" {
@@ -262,6 +323,16 @@ fn handle_http_connection(
             );
             return;
         }
+        if path == "/api/debug-log" {
+            let logs = get_recent_logs_text();
+            send_response(
+                &mut stream,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                logs.as_bytes(),
+            );
+            return;
+        }
         if path.starts_with("/stream/") {
             let track_id = path.trim_start_matches("/stream/").trim_end_matches(".wav");
             let wav = synthesize_wav_track(track_id);
@@ -278,23 +349,24 @@ fn handle_http_connection(
         if path == "/api/discover" {
             let mut devs = vec![
                 format!(
-                    r#"{{"name":"Sound Bar SJ8 (Built-In Rust Simulator)","ip":"127.0.0.1","port":{},"model":"SJ8","isSimulator":true,"verified":true}}"#,
+                    r#"{{"name":"Sound Bar SJ8 (Built-In Rust Simulator)","host":"127.0.0.1","ip":"127.0.0.1","port":{},"model":"SJ8","isSimulator":true,"verified":true,"protocol":"TCP 9741 (SJ8 V1 AES-256-CBC)"}}"#,
                     mock_port
                 ),
                 format!(
-                    r#"{{"name":"Sound Bar SJ8 (OpenWrt Routed LAN)","ip":"192.168.0.10","port":9741,"model":"SJ8","mac":"7c:1c:4e:3b:b0:22","isSimulator":false,"verified":{}}}"#,
+                    r#"{{"name":"Sound Bar SJ8 (OpenWrt Routed LAN)","host":"192.168.0.10","ip":"192.168.0.10","port":9741,"model":"SJ8","mac":"7c:1c:4e:3b:b0:22","isSimulator":false,"verified":{},"protocol":"TCP 9741 Hardware Endpoint"}}"#,
                     probe_soundbar_port("192.168.0.10", 9741, 450)
                 ),
                 format!(
-                    r#"{{"name":"MusicFlow_Setup AP (Wi-Fi Provisioning Mode)","ip":"192.168.5.100","port":9741,"model":"SJ8 Setup AP","isSimulator":false,"verified":{}}}"#,
+                    r#"{{"name":"MusicFlow_Setup AP (Wi-Fi Provisioning Mode)","host":"192.168.5.100","ip":"192.168.5.100","port":9741,"model":"SJ8 Setup AP","isSimulator":false,"verified":{},"protocol":"TCP 9741 AP Provisioning"}}"#,
                     probe_soundbar_port("192.168.5.100", 9741, 350)
                 ),
             ];
             for (ip, banner) in discover_ssdp_multicast(800) {
                 if ip != "192.168.0.10" {
                     devs.push(format!(
-                        r#"{{"name":{},"ip":{},"port":9741,"model":"SSDP MediaRenderer","isSimulator":false,"verified":true}}"#,
+                        r#"{{"name":{},"host":{},"ip":{},"port":9741,"model":"SSDP MediaRenderer","isSimulator":false,"verified":true,"protocol":"UDP 1900 SSDP"}}"#,
                         json_str(&banner),
+                        json_str(&ip),
                         json_str(&ip)
                     ));
                 }
@@ -307,42 +379,64 @@ fn handle_http_connection(
 
     // POST / DELETE API Routes
     match (method, path) {
+        ("POST", "/api/client-log") => {
+            log_debug("UI-CLIENT-ERROR", &body_str);
+            send_json(&mut stream, r#"{"ok":true}"#);
+        }
+        ("POST", "/api/refresh") => {
+            if let Ok(mut guard) = controller.lock() {
+                guard.query_initial_sj8_state();
+            }
+            send_json(&mut stream, r#"{"ok":true}"#);
+        }
         ("POST", "/api/connect") => {
+            let req_host = body_json
+                .as_ref()
+                .and_then(|b| b.get_str("host"))
+                .unwrap_or("192.168.0.10")
+                .to_string();
+            let req_port = body_json
+                .as_ref()
+                .and_then(|b| b.get_i64("port"))
+                .unwrap_or(9741) as u16;
             let is_sim = body_json
                 .as_ref()
                 .and_then(|b| b.get_bool("isSimulator"))
-                .unwrap_or(false);
+                .unwrap_or(req_host == "127.0.0.1" && (req_port == 19741 || req_port == mock_port));
             let host = if is_sim {
                 "127.0.0.1".to_string()
             } else {
-                body_json
-                    .as_ref()
-                    .and_then(|b| b.get_str("host"))
-                    .unwrap_or("192.168.0.10")
-                    .to_string()
+                req_host
             };
-            let port = if is_sim {
-                mock_port
-            } else {
-                body_json
-                    .as_ref()
-                    .and_then(|b| b.get_i64("port"))
-                    .unwrap_or(9741) as u16
-            };
+            let port = if is_sim { mock_port } else { req_port };
             let enc = body_json
                 .as_ref()
                 .and_then(|b| b.get_str("encryption"))
                 .map(EncryptionMode::from_str)
                 .unwrap_or(EncryptionMode::Sj8V1);
 
+            log_debug(
+                "CONNECT",
+                &format!(
+                    "Connecting to {}:{} (cipher={}, isSimulator={})",
+                    host,
+                    port,
+                    enc.as_str(),
+                    is_sim
+                ),
+            );
             let ok = connect_soundbar_tcp(&controller, &host, port, enc, is_sim);
             thread::sleep(Duration::from_millis(80));
             if let Ok(guard) = controller.lock() {
-                let resp = format!(
-                    r#"{{"ok":{},"soundbar":{}}}"#,
-                    ok,
-                    guard.soundbar_state_json()
-                );
+                let st = guard.soundbar_state_json();
+                let resp = if ok {
+                    format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st)
+                } else {
+                    format!(
+                        r#"{{"ok":false,"error":"Failed to connect to {}:{}","state":{}}}"#,
+                        host, port, st
+                    )
+                };
                 send_json(&mut stream, &resp);
             }
         }
@@ -351,7 +445,8 @@ fn handle_http_connection(
                 guard.connected = false;
                 guard.tcp_writer = None;
                 guard.broadcast_state();
-                let resp = format!(r#"{{"ok":true,"soundbar":{}}}"#, guard.soundbar_state_json());
+                let st = guard.soundbar_state_json();
+                let resp = format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st);
                 send_json(&mut stream, &resp);
             }
         }
@@ -366,23 +461,26 @@ fn handle_http_connection(
                 .unwrap_or("");
             let host = body_json
                 .as_ref()
-                .and_then(|b| b.get_str("setupHost"))
+                .and_then(|b| b.get_str("apHost").or_else(|| b.get_str("setupHost")))
                 .unwrap_or("192.168.5.100");
             let port = body_json
                 .as_ref()
-                .and_then(|b| b.get_i64("port"))
+                .and_then(|b| b.get_i64("apPort").or_else(|| b.get_i64("port")))
                 .unwrap_or(9741) as u16;
             let cmd = format!(
                 r#"{{"data":{{"home_ap_security_type":"WPA2","home_ap_ssid":{},"home_ap_ key":{},"bridge__enable":"no"}},"msg":"SHARE_HOME_INFO"}}"#,
                 json_str(ssid),
                 json_str(pwd)
             );
+            log_debug(
+                "PROVISION",
+                &format!("Sending SHARE_HOME_INFO (SSID={}) to {}:{}", ssid, host, port),
+            );
             match send_one_shot_lg_command(host, port, &cmd, EncryptionMode::Sj8V1) {
                 Ok(replies) => {
-                    let rep_str: Vec<String> = replies.into_iter().collect();
                     send_json(
                         &mut stream,
-                        &format!(r#"{{"ok":true,"responses":[{}]}}"#, rep_str.join(",")),
+                        &format!(r#"{{"ok":true,"responses":[{}]}}"#, replies.join(",")),
                     );
                 }
                 Err(e) => send_json(
@@ -406,13 +504,17 @@ fn handle_http_connection(
                 .unwrap_or("7c:1c:4e:3b:b0:22");
             let name = body_json
                 .as_ref()
-                .and_then(|b| b.get_str("name"))
+                .and_then(|b| b.get_str("speakerName").or_else(|| b.get_str("name")))
                 .unwrap_or("Sound Bar SJ8");
             let cmd = format!(
                 r#"{{"data":{{"ip":{},"mac":{},"name":{}}},"msg":"SPK_ADD_SET"}}"#,
                 json_str(host),
                 json_str(mac),
                 json_str(name)
+            );
+            log_debug(
+                "REGISTER",
+                &format!("Sending SPK_ADD_SET (name={}) to {}:{}", name, host, port),
             );
             match send_one_shot_lg_command(host, port, &cmd, EncryptionMode::Sj8V1) {
                 Ok(replies) => send_json(
@@ -434,7 +536,7 @@ fn handle_http_connection(
                     .clamp(0, guard.max_volume);
                 let fade = body_json
                     .as_ref()
-                    .and_then(|b| b.get_i64("fadeSeconds"))
+                    .and_then(|b| b.get_i64("fadeTime").or_else(|| b.get_i64("fadeSeconds")))
                     .unwrap_or(0);
                 guard.volume = vol;
                 guard.send_raw_json(
@@ -445,8 +547,9 @@ fn handle_http_connection(
                     None,
                 );
                 guard.broadcast_state();
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
         ("POST", "/api/mute") => {
             if let Ok(mut guard) = controller.lock() {
@@ -460,14 +563,15 @@ fn handle_http_connection(
                     None,
                 );
                 guard.broadcast_state();
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
         ("POST", "/api/function") => {
             if let Ok(mut guard) = controller.lock() {
                 let func = body_json
                     .as_ref()
-                    .and_then(|b| b.get_i64("funcId"))
+                    .and_then(|b| b.get_i64("functionId").or_else(|| b.get_i64("funcId")).or_else(|| b.get_i64("function")))
                     .unwrap_or(0);
                 guard.current_function = func;
                 guard.send_raw_json(
@@ -475,14 +579,15 @@ fn handle_http_connection(
                     None,
                 );
                 guard.broadcast_state();
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
         ("POST", "/api/eq") => {
             if let Ok(mut guard) = controller.lock() {
                 let eq = body_json
                     .as_ref()
-                    .and_then(|b| b.get_i64("eqId"))
+                    .and_then(|b| b.get_i64("eqId").or_else(|| b.get_i64("eq")))
                     .unwrap_or(0);
                 guard.current_eq = eq;
                 guard.send_raw_json(
@@ -490,8 +595,9 @@ fn handle_http_connection(
                     None,
                 );
                 guard.broadcast_state();
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
         ("POST", "/api/tone") => {
             if let Ok(mut guard) = controller.lock() {
@@ -510,7 +616,7 @@ fn handle_http_connection(
                             None,
                         );
                     }
-                    if let Some(v) = b.get_i64("balance") {
+                    if let Some(v) = b.get_i64("lrBalance").or_else(|| b.get_i64("balance")) {
                         guard.balance = v;
                         guard.send_raw_json(
                             &format!(r#"{{"msg":"EQ_SETTING","data":{{"type":3,"value":{}}}}}"#, v),
@@ -525,10 +631,11 @@ fn handle_http_connection(
                     }
                 }
                 guard.broadcast_state();
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
-        ("POST", "/api/settings") => {
+        ("POST", "/api/settings") | ("POST", "/api/sound-tuning") => {
             if let Ok(mut guard) = controller.lock() {
                 if let Some(b) = body_json.as_ref() {
                     if let Some(w) = b.get_i64("wooferLevel") {
@@ -640,8 +747,9 @@ fn handle_http_connection(
                     }
                 }
                 guard.broadcast_state();
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
         ("POST", "/api/test-tone") => {
             if let Ok(mut guard) = controller.lock() {
@@ -649,7 +757,7 @@ fn handle_http_connection(
             }
             send_json(&mut stream, r#"{"ok":true}"#);
         }
-        ("POST", "/api/alarms") => {
+        ("POST", "/api/alarms") | ("POST", "/api/alarm") => {
             if let Ok(mut guard) = controller.lock() {
                 if let Some(b) = body_json.as_ref() {
                     let days: Vec<u8> = b
@@ -684,7 +792,7 @@ fn handle_http_connection(
                         volume: b.get_i64("volume").unwrap_or(15).clamp(1, 40),
                         duration_minutes: b.get_i64("durationMinutes").unwrap_or(30),
                         enable: true,
-                        shuffle: false,
+                        shuffle: b.get_bool("shuffle").unwrap_or(false),
                         source_type: source_type.clone(),
                         spotify_uri: b
                             .get_str("spotifyUri")
@@ -710,7 +818,7 @@ fn handle_http_connection(
                         )
                     };
                     let cmd = format!(
-                        r#"{{"msg":"ALARM_SET","data":{{"id":-1,"modifiedid":{},"mode":0,"day":{},"dayrepeat":true,"hour":{},"minute":{},"type":{},"duration":{},"volume":{},"enable":true,"shuffle":false,"title":{},"ipaddress":"","songpath":{}}}}}"#,
+                        r#"{{"msg":"ALARM_SET","data":{{"id":-1,"modifiedid":{},"mode":0,"day":{},"dayrepeat":true,"hour":{},"minute":{},"type":{},"duration":{},"volume":{},"enable":true,"shuffle":{},"title":{},"ipaddress":"","songpath":{}}}}}"#,
                         entry.id,
                         entry.days_bitmask,
                         entry.hour,
@@ -718,6 +826,7 @@ fn handle_http_connection(
                         alarm_type,
                         entry.duration_minutes,
                         entry.volume,
+                        entry.shuffle,
                         json_str(&entry.title),
                         json_str(&songpath)
                     );
@@ -725,8 +834,13 @@ fn handle_http_connection(
                     guard.send_raw_json(&cmd, None);
                     guard.broadcast_state();
                 }
+                let alarms = guard.alarms_array_json();
+                let st = guard.soundbar_state_json();
+                send_json(
+                    &mut stream,
+                    &format!(r#"{{"ok":true,"alarms":{},"state":{},"soundbar":{}}}"#, alarms, st, st),
+                );
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
         ("POST", p) if p.starts_with("/api/alarms/") && p.ends_with("/toggle") => {
             let id_str = p
@@ -750,8 +864,12 @@ fn handle_http_connection(
                     None,
                 );
                 guard.broadcast_state();
+                let alarms = guard.alarms_array_json();
+                send_json(
+                    &mut stream,
+                    &format!(r#"{{"ok":true,"alarms":{}}}"#, alarms),
+                );
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
         ("POST", p) if p.starts_with("/api/alarms/") && p.ends_with("/trigger") => {
             let id_str = p
@@ -770,8 +888,9 @@ fn handle_http_connection(
                     );
                     guard.broadcast_state();
                 }
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{}}}"#, st));
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
         ("DELETE", p) if p.starts_with("/api/alarms/") => {
             let id_str = p.trim_start_matches("/api/alarms/");
@@ -786,10 +905,14 @@ fn handle_http_connection(
                     None,
                 );
                 guard.broadcast_state();
+                let alarms = guard.alarms_array_json();
+                send_json(
+                    &mut stream,
+                    &format!(r#"{{"ok":true,"alarms":{}}}"#, alarms),
+                );
             }
-            send_json(&mut stream, r#"{"ok":true}"#);
         }
-        ("POST", "/api/spotify/config") => {
+        ("POST", "/api/spotify/config") | ("POST", "/api/spotify/token") => {
             if let Ok(mut guard) = controller.lock() {
                 if let Some(cid) = body_json.as_ref().and_then(|b| b.get_str("clientId")) {
                     guard.spotify_client_id = cid.to_string();
@@ -798,13 +921,31 @@ fn handle_http_connection(
                 send_json(&mut stream, &format!(r#"{{"ok":true,"spotify":{}}}"#, sp));
             }
         }
+        ("POST", "/api/spotify/auth-url") => {
+            let cid = body_json
+                .as_ref()
+                .and_then(|b| b.get_str("clientId"))
+                .unwrap_or("lg-musicflow-client");
+            let auth_url = format!(
+                "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri=http://127.0.0.1:{}/api/spotify/callback&scope=user-read-playback-state%20user-modify-playback-state",
+                cid, api_port
+            );
+            send_json(
+                &mut stream,
+                &format!(r#"{{"ok":true,"authUrl":{}}}"#, json_str(&auth_url)),
+            );
+        }
         ("POST", "/api/spotify/transfer") => {
             if let Ok(mut guard) = controller.lock() {
                 guard.current_function = 8;
                 guard.send_raw_json(r#"{"msg":"FUNCTION_SET","data":{"func":8}}"#, None);
                 guard.broadcast_state();
                 let sp = guard.spotify_state_json();
-                send_json(&mut stream, &format!(r#"{{"ok":true,"spotify":{}}}"#, sp));
+                let sb = guard.soundbar_state_json();
+                send_json(
+                    &mut stream,
+                    &format!(r#"{{"ok":true,"spotify":{},"soundbar":{}}}"#, sp, sb),
+                );
             }
         }
         ("POST", "/api/spotify/play") => {
@@ -813,6 +954,9 @@ fn handle_http_connection(
                     .as_ref()
                     .and_then(|b| b.get_str("uri"))
                     .unwrap_or("spotify:playlist:37i9dQZF1DXbITWG1ZJKYt");
+                if let Some(title) = body_json.as_ref().and_then(|b| b.get_str("title")) {
+                    guard.play_title = title.to_string();
+                }
                 guard.current_function = 8;
                 guard.spotify_playing = true;
                 guard.play_playing = true;
@@ -825,7 +969,11 @@ fn handle_http_connection(
                 );
                 guard.broadcast_state();
                 let sp = guard.spotify_state_json();
-                send_json(&mut stream, &format!(r#"{{"ok":true,"spotify":{}}}"#, sp));
+                let sb = guard.soundbar_state_json();
+                send_json(
+                    &mut stream,
+                    &format!(r#"{{"ok":true,"spotify":{},"soundbar":{}}}"#, sp, sb),
+                );
             }
         }
         ("POST", "/api/spotify/toggle") => {
@@ -836,6 +984,45 @@ fn handle_http_connection(
                 let sp = guard.spotify_state_json();
                 send_json(&mut stream, &format!(r#"{{"ok":true,"spotify":{}}}"#, sp));
             }
+        }
+        ("POST", "/api/media/play") => {
+            let track_id = body_json
+                .as_ref()
+                .and_then(|b| b.get_str("trackId"))
+                .unwrap_or("track-sunrise-flac");
+            let url = format!("http://127.0.0.1:{}/stream/{}.wav", api_port, track_id);
+            if let Ok(mut guard) = controller.lock() {
+                guard.current_function = 0;
+                guard.play_title = track_id.to_string();
+                guard.play_source_app = "MusicFlow DMS (:49252)".to_string();
+                guard.send_raw_json(
+                    &format!(
+                        r#"{{"msg":"LOCAL_PLAY_URL","data":{{"url":{},"title":{}}}}}"#,
+                        json_str(&url),
+                        json_str(track_id)
+                    ),
+                    None,
+                );
+                guard.broadcast_state();
+                let sb = guard.soundbar_state_json();
+                send_json(
+                    &mut stream,
+                    &format!(
+                        r#"{{"ok":true,"streamUrl":{},"soundbar":{}}}"#,
+                        json_str(&url),
+                        sb
+                    ),
+                );
+            }
+        }
+        ("POST", "/api/media/scan") => {
+            send_json(
+                &mut stream,
+                &format!(
+                    r#"{{"ok":true,"tracks":{}}}"#,
+                    SoundbarController::media_tracks_json()
+                ),
+            );
         }
         ("POST", p) if p.starts_with("/api/media/") && p.ends_with("/beam") => {
             let track_id = p
@@ -855,8 +1042,16 @@ fn handle_http_connection(
                     None,
                 );
                 guard.broadcast_state();
+                let sb = guard.soundbar_state_json();
+                send_json(
+                    &mut stream,
+                    &format!(
+                        r#"{{"ok":true,"streamUrl":{},"soundbar":{}}}"#,
+                        json_str(&url),
+                        sb
+                    ),
+                );
             }
-            send_json(&mut stream, &format!(r#"{{"ok":true,"streamUrl":{}}}"#, json_str(&url)));
         }
         ("POST", p) if p.starts_with("/api/mesh/") => {
             let node_id = p.trim_start_matches("/api/mesh/");
@@ -879,7 +1074,11 @@ fn handle_http_connection(
                 }
                 guard.broadcast_state();
                 let state = guard.soundbar_state_json();
-                send_json(&mut stream, &format!(r#"{{"ok":true,"soundbar":{}}}"#, state));
+                let mesh = guard.mesh_nodes_array_json();
+                send_json(
+                    &mut stream,
+                    &format!(r#"{{"ok":true,"soundbar":{},"meshNodes":{}}}"#, state, mesh),
+                );
             }
         }
         ("POST", "/api/raw-packet") => {
@@ -932,6 +1131,7 @@ fn send_response(stream: &mut TcpStream, status: &str, content_type: &str, body:
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body);
+    let _ = stream.flush();
 }
 
 #[cfg(test)]
@@ -956,7 +1156,14 @@ mod tests {
             assert_eq!(guard.woofer_raw, 15);
             assert_eq!(guard.woofer_level, 0);
 
-            guard.send_raw_json(r#"{"msg":"VOLUME_SETTING","data":{"volume":24,"fadetime":0}}"#, None);
+            let state_json = guard.soundbar_state_json();
+            assert!(state_json.contains("\"availableFunctions\":[0,15,1,12,6,5,8,14]"));
+            assert!(state_json.contains("\"availableEqs\":[14,0,7,12]"));
+
+            guard.send_raw_json(
+                r#"{"msg":"VOLUME_SETTING","data":{"volume":24,"fadetime":0}}"#,
+                None,
+            );
             guard.send_raw_json(r#"{"msg":"EQ_SETTING","data":{"eq":14}}"#, None);
             guard.send_raw_json(r#"{"msg":"WOOFER_LEVEL_SET","data":{"wooferlevel":19}}"#, None);
         }
@@ -971,4 +1178,3 @@ mod tests {
         }
     }
 }
-
