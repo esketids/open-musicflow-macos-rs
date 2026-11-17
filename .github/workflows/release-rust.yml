@@ -104,7 +104,4 @@ jobs:
       - name: Upload Windows x64 .exe to GitHub Release v1.0.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload v1.0.0 \
-            release/open-musicflow-rs-v1.0.0-windows-x64.zip \
-            --clobber || true
+        run: gh release upload v1.0.0 release/open-musicflow-rs-v1.0.0-windows-x64.zip --clobber
