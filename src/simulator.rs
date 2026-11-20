@@ -42,11 +42,17 @@ struct SimState {
     wooferlevel: i64, // Raw 0..21 (offset -15 => -15..+6 dB)
     rearboxlevel: i64,
     autopower: bool,
+    autodisplay: bool,
     ledset: bool,
     tvremote: bool,
     btstandby: bool,
     limit_bt_conn: bool,
+    rearboxon: bool,
     sleeptime: i64,
+    ssid: String,
+    playing: i64, // 0=PLAY, 1=PAUSE, 2=STOP, 3=FULL_STOP, 4=BUFFERING
+    play_repeat: i64,
+    play_shuffle: bool,
     play_title: String,
     play_artist: String,
     play_album: String,
@@ -75,11 +81,17 @@ impl SimState {
             wooferlevel: 15, // 15 + (-15) = 0 dB
             rearboxlevel: 0,
             autopower: true,
+            autodisplay: true,
             ledset: true,
             tvremote: true,
             btstandby: true,
             limit_bt_conn: false,
+            rearboxon: false,
             sleeptime: 0,
+            ssid: "Adnan_Home_WiFi".to_string(),
+            playing: 0,
+            play_repeat: 0,
+            play_shuffle: true,
             play_title: "Bandit".to_string(),
             play_artist: "EsDeeKid".to_string(),
             play_album: "Bandit - Single".to_string(),
@@ -125,7 +137,7 @@ impl SimState {
         let mut items = Vec::new();
         for a in &self.alarms {
             items.push(format!(
-                r#"{{"id":{},"title":{},"hour":{},"minute":{},"day":{},"dayrepeat":{},"volume":{},"duration":{},"type":{},"enable":{},"shuffle":{},"ipaddress":{},"songpath":{}}}"#,
+                r#"{{"id":{},"title":{},"hour":{},"minute":{},"day":{},"dayrepeat":{},"volume":{},"duration":{},"type":{},"enable":{},"shuffle":{},"ipaddress":{},"path":{},"songpath":{}}}"#,
                 a.id,
                 json_str(&a.title),
                 a.hour,
@@ -138,6 +150,7 @@ impl SimState {
                 a.enable,
                 a.shuffle,
                 json_str(&a.ipaddress),
+                json_str(&a.songpath),
                 json_str(&a.songpath),
             ));
         }
@@ -203,33 +216,42 @@ fn build_sim_replies(
     match msg {
         "PRODUCT_INFO" => vec![
             format!(
-                r#"{{"msg":"PRODUCT_INFO","result":"ok","data":{{"info":{{"ip":"192.168.0.10","mac":"7c:1c:4e:3b:b0:22","modelname":"SJ8","modelnum":14,"name":{},"network":2,"petname":{},"protoVer":1,"region":"SG"," registered":true,"role":"none"}}}}}}"#,
+                r#"{{"msg":"PRODUCT_INFO","result":"OK","data":{{"reg":true,"network":1,"protover":1,"region":"SG","modeltype":2,"petname":{},"modelname":"SJ8","modelnum":14,"info":{{"name":{},"icon":0,"groupid":0,"ledset":{},"channel":0,"groupcolor":0,"function":{},"spktype":0,"playing":{},"vol":{},"wirelessmac":"7c:1c:4e:3b:b0:22","mute":{},"update":false,"eqlist":[14,0,7,12],"functionlist":[0,15,1,12,6,5,8],"demo":false,"bever":"NB9.504.00629.C","btmac":"08:EF:3B:9C:2D:4F"}}}}}}"#,
+                json_str(&st.petname),
                 json_str(&st.name),
-                json_str(&st.petname)
+                st.ledset,
+                st.function,
+                st.playing == 0 || st.playing == 4,
+                st.volume,
+                st.mute,
             ),
-            r#"{"msg":"SYSTEM_VER_INFO","result":"ok","data":{"system":"NB9.504.00629.C","micom":"1904080","hdmi":"1807100","c4a":"1.36.145853"}}"#.to_string(),
+        ],
+        "SYSTEM_VER_REQ" => vec![
+            r#"{"msg":"SYSTEM_VER_REQ","result":"OK","data":{"be":"NB9.504.00629.C","micom":"1904080","hdmi":"1807100","c4a":"1.36.145853"}}"#.to_string(),
         ],
         "RADIO_PART_CONN_GET" => vec![
-            r#"{"msg":"RADIO_PART_CONN_RESP","result":"ok","data":{"status":1}}"#.to_string(),
+            r#"{"msg":"RADIO_PART_CONN_RESP","result":"OK","data":{"status":1}}"#.to_string(),
         ],
         "MAC_INFO_REQ" | "MAC_INFO_DEV" => vec![
-            r#"{"msg":"MAC_INFO_DEV","result":"ok","data":{"btmac":"08:EF:3B:9C:2D:4F","lanmac":"00:e0:4c:36:14:98","wifimac":"7c:1c:4e:3b:b0:22"}}"#.to_string(),
+            r#"{"msg":"MAC_INFO_DEV","result":"OK","data":{"btmac":"08:EF:3B:9C:2D:4F","lanmac":"00:e0:4c:36:14:98","wifimac":"7c:1c:4e:3b:b0:22"}}"#.to_string(),
         ],
-        "NET_INFO_REQ" => vec![
-            r#"{"msg":"NET_INFO_DEV","result":"ok","data":{"meshch":0,"miracast":"off"," mode":5,"role":0,"rssi":3,"ssid":"Adnan_Home_WiFi"}}"#.to_string(),
-        ],
+        "NETWORK_INFO_REQ" | "NET_INFO_REQ" => vec![format!(
+            r#"{{"msg":"NETWORK_INFO_REQ","result":"OK","data":{{"meshch":0,"network":1,"ssid":{}}}}}"#,
+            json_str(&st.ssid)
+        )],
         "EQ_INFO_REQ" => vec![format!(
-            r#"{{"msg":"EQ_INFO","result":"ok","data":{{"eq":{},"eqcount":4,"eqlist":[14,0,7,12],"bass":{},"treble":{},"balance":{}}}}}"#,
+            r#"{{"msg":"EQ_INFO_REQ","result":"OK","data":{{"currenteq":{},"bass":{},"treble":{},"lrbal":{}}}}}"#,
             st.eq, st.bass, st.treble, st.balance
         )],
         "SETTING_INFO_REQ" => vec![format!(
-            r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"Audio Guide":false,"auxcable":false,"display":true,"nightmode":{},"autovol":{},"drc":{},"avsync":{},"avsyncmax":300,"avsyncmin":0,"rearbox":false,"rearboxlevel":{},"rearboxmax":6,"rearboxmin":-6,"rearboxoffset":0,"sleep":{},"tvremote":{},"visible_alarm":true,"visible_autopower":true,"visible_avsync":true,"visible_btlimit":true,"visible_btstandby":true,"visible_led":true,"visible_nightmode":true,"visible_SIMPLINK":false,"visible_tvremote":true,"visible_woofer":true,"woofer":true,"wooferlevel":{},"woofermax":21,"woofermin":0,"wooferoffset":-15,"autopower":{},"btstandby":{},"limit_bt_conn":{},"ledset":{}}}}}"#,
+            r#"{{"msg":"SETTING_INFO_REQ","result":"OK","data":{{"autodisplay":{},"nightmode":{},"autovol":{},"drc":{},"avsync":{},"rearboxon":{},"rearboxlevel":{},"rearboxoffset":0,"tvremote":{},"visible_alarm":true,"visible_tonectrl":true,"wooferlevel":{},"woofermax":21,"wooferoffset":-15,"autopower":{},"btstandby":{},"limit_bt_conn":{},"ledset":{},"ipv4addr":"192.168.0.10"}}}}"#,
+            st.autodisplay,
             st.nightmode,
             st.autovol,
             st.drc,
             st.avsync,
+            st.rearboxon,
             st.rearboxlevel,
-            st.sleeptime,
             st.tvremote,
             st.wooferlevel,
             st.autopower,
@@ -237,44 +259,133 @@ fn build_sim_replies(
             st.limit_bt_conn,
             st.ledset
         )],
-        "PLAY_INFO" => vec![format!(
-            r#"{{"msg":"PLAY_INFO","result":"ok","data":{{"album":{},"artist":{},"cpname":{},"duration":{},"icon":2,"mute":{},"playstatus":"play","position":{},"repeat":0,"shuffle":true,"support":191,"title":{},"type":1,"volume":{},"maxvolume":40}}}}"#,
-            json_str(&st.play_album),
-            json_str(&st.play_artist),
-            json_str(&st.play_cpname),
-            st.play_dur,
-            st.mute,
-            st.play_pos,
-            json_str(&st.play_title),
-            st.volume
-        )],
+        "PLAY_INFO" | "PLAY_INFO_REQ" | "CP_INFO_REQ" | "CP_PLAY_URL" | "LOCAL_PLAY_URL" => {
+            if let Some(d) = data {
+                let item = d.get("item").unwrap_or(d);
+                if let Some(t) = item.get_str("title") {
+                    if !t.is_empty() {
+                        st.play_title = t.to_string();
+                    }
+                }
+                if let Some(a) = item.get_str("artist") {
+                    if !a.is_empty() {
+                        st.play_artist = a.to_string();
+                    }
+                }
+                if let Some(al) = item.get_str("albumtitle").or_else(|| item.get_str("album")) {
+                    if !al.is_empty() {
+                        st.play_album = al.to_string();
+                    }
+                }
+                if let Some(p) = d.get_i64("playing") {
+                    st.playing = p;
+                } else if msg == "LOCAL_PLAY_URL" || msg == "CP_PLAY_URL" {
+                    st.playing = 0;
+                }
+            }
+            let reply_msg = match msg {
+                "PLAY_INFO_REQ" => "PLAY_INFO_REQ",
+                "CP_INFO_REQ" => "CP_INFO_REQ",
+                _ => "PLAY_INFO",
+            };
+            vec![format!(
+                r#"{{"msg":{},"result":"OK","data":{{"albumtitle":{},"artist":{},"c4aappname":{},"duration":{},"playing":{},"position":{},"repeat":{},"shuffle":{},"title":{},"cptype":2}}}}"#,
+                json_str(reply_msg),
+                json_str(&st.play_album),
+                json_str(&st.play_artist),
+                json_str(&st.play_cpname),
+                st.play_dur,
+                st.playing,
+                st.play_pos,
+                st.play_repeat,
+                st.play_shuffle,
+                json_str(&st.play_title),
+            )]
+        }
+        "PLAY_CMD" => {
+            let mut ctrl = 0i64;
+            if let Some(d) = data {
+                ctrl = d.get_i64("playctrl").unwrap_or(0);
+                if ctrl == 0 || ctrl == 1 || ctrl == 2 {
+                    st.playing = ctrl;
+                } else if ctrl == 3 || ctrl == 5 {
+                    st.play_pos = 0;
+                }
+                if let Some(rep) = d.get_i64("repeat") {
+                    st.play_repeat = rep;
+                }
+                if let Some(shuf) = d.get_bool("shuffle") {
+                    st.play_shuffle = shuf;
+                }
+            }
+            vec![
+                format!(
+                    r#"{{"msg":"PLAY_CMD","result":"OK","data":{{"playctrl":{},"repeat":{},"shuffle":{}}}}}"#,
+                    ctrl, st.play_repeat, st.play_shuffle
+                ),
+                format!(
+                    r#"{{"msg":"PLAY_INFO","data":{{"albumtitle":{},"artist":{},"c4aappname":{},"duration":{},"playing":{},"position":{},"repeat":{},"shuffle":{},"title":{},"cptype":2}}}}"#,
+                    json_str(&st.play_album),
+                    json_str(&st.play_artist),
+                    json_str(&st.play_cpname),
+                    st.play_dur,
+                    st.playing,
+                    st.play_pos,
+                    st.play_repeat,
+                    st.play_shuffle,
+                    json_str(&st.play_title),
+                ),
+            ]
+        }
+        "LOCAL_TIME_SEARCH" => {
+            if let Some(d) = data {
+                if let Some(t) = d.get_i64("time") {
+                    st.play_pos = t.clamp(0, st.play_dur);
+                }
+            }
+            vec![format!(
+                r#"{{"msg":"LOCAL_TIME_SEARCH","result":"OK","data":{{"time":{}}}}}"#,
+                st.play_pos
+            )]
+        }
+        "PLAY_TIME_SET" => vec![r#"{"msg":"PLAY_TIME_SET","result":"OK"}"#.to_string()],
         "FUNC_INFO_REQ" => vec![format!(
-            r#"{{"msg":"FUNC_INFO","result":"ok","data":{{"cptype":2,"functionlist":[0,15,1,12,6,5],"sub_type":0,"type":{}}}}}"#,
-            st.function
+            r#"{{"msg":"FUNC_INFO_REQ","result":"OK","data":{{"type":{},"mute":{},"btname":"","connect":{}}}}}"#,
+            st.function,
+            st.mute,
+            if st.function == 8 { 1 } else { 0 }
         )],
         "FUNC_NAME_REQ" => vec![
-            r#"{"msg":"FUNC_NAME_INFO","result":"ok","data":{"func":15,"name":"OPTICAL/HDMI ARC"}}"#.to_string(),
+            r#"{"msg":"FUNC_NAME_REQ","result":"OK","data":{"func":15,"name":"Optical/HDMI ARC"}}"#.to_string(),
         ],
         "ALARM_STATE_REQ" => vec![
-            r#"{"msg":"ALARM_STATE","result":"ok","data":{"state":"ok"}}"#.to_string(),
+            r#"{"msg":"ALARM_STATE_NOTI","data":{"on":false}}"#.to_string(),
         ],
         "ALARM_LIST_REQ" => vec![format!(
-            r#"{{"msg":"ALARM_INFO","result":"ok","data":{{"alarmlist":{}}}}}"#,
+            r#"{{"msg":"ALARM_LIST_REQ","result":"OK","data":{{"info":{}}}}}"#,
             st.alarms_json()
         )],
         "SLEEP_INFO_REQ" => vec![format!(
-            r#"{{"msg":"SLEEP_INFO","result":"ok","data":{{"time":{}}}}}"#,
+            r#"{{"msg":"SLEEP_INFO_REQ","result":"OK","data":{{"time":{}}}}}"#,
             st.sleeptime
         )],
         "VOLUME_SETTING" => {
             if let Some(d) = data {
-                if let Some(v) = d.get_i64("volume") {
+                if let Some(v) = d.get_i64("vol").or_else(|| d.get_i64("volume")) {
                     st.volume = v.clamp(0, 40);
                 }
             }
             vec![format!(
-                r#"{{"msg":"VOLUME_INFO","result":"ok","data":{{"volume":{},"maxvolume":40,"mute":{}}}}}"#,
-                st.volume, st.mute
+                r#"{{"msg":"VOLUME_CHANGE","result":"OK","data":{{"vol":{}}}}}"#,
+                st.volume
+            )]
+        }
+        "VOLUME_UP" | "VOLUME_DOWN" => {
+            let delta = if msg == "VOLUME_UP" { 1 } else { -1 };
+            st.volume = (st.volume + delta).clamp(0, 40);
+            vec![format!(
+                r#"{{"msg":"VOLUME_CHANGE","result":"OK","data":{{"vol":{}}}}}"#,
+                st.volume
             )]
         }
         "MUTE_SET" => {
@@ -284,38 +395,40 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"VOLUME_INFO","result":"ok","data":{{"volume":{},"maxvolume":40,"mute":{}}}}}"#,
-                st.volume, st.mute
+                r#"{{"msg":"MUTE_CHANGE","result":"OK","data":{{"mute":{}}}}}"#,
+                st.mute
             )]
         }
         "FUNCTION_SET" => {
             if let Some(d) = data {
-                if let Some(f) = d.get_i64("func") {
+                if let Some(f) = d.get_i64("type").or_else(|| d.get_i64("func")) {
                     st.function = f;
                 }
             }
             vec![format!(
-                r#"{{"msg":"FUNC_INFO","result":"ok","data":{{"cptype":2,"functionlist":[0,15,1,12,6,5],"sub_type":0,"type":{}}}}}"#,
-                st.function
+                r#"{{"msg":"FUNC_INFO","result":"OK","data":{{"type":{},"mute":{},"btname":"","connect":{}}}}}"#,
+                st.function,
+                st.mute,
+                if st.function == 8 { 1 } else { 0 }
             )]
         }
         "EQ_SETTING" => {
             if let Some(d) = data {
-                if let Some(eq) = d.get_i64("eq") {
-                    st.eq = eq;
-                }
                 if let Some(t) = d.get_i64("type") {
                     let v = d.get_i64("value").unwrap_or(0);
                     match t {
+                        0 => st.eq = v,
                         1 => st.bass = v,
                         2 => st.treble = v,
                         3 => st.balance = v,
                         _ => {}
                     }
+                } else if let Some(eq) = d.get_i64("eq") {
+                    st.eq = eq;
                 }
             }
             vec![format!(
-                r#"{{"msg":"EQ_INFO","result":"ok","data":{{"eq":{},"eqcount":4,"eqlist":[14,0,7,12],"bass":{},"treble":{},"balance":{}}}}}"#,
+                r#"{{"msg":"EQ_INFO_REQ","result":"OK","data":{{"currenteq":{},"bass":{},"treble":{},"lrbal":{}}}}}"#,
                 st.eq, st.bass, st.treble, st.balance
             )]
         }
@@ -326,7 +439,7 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"wooferlevel":{},"wooferoffset":-15,"woofermax":21}}}}"#,
+                r#"{{"msg":"WOOFER_LEVEL_SET","result":"OK","data":{{"wooferlevel":{}}}}}"#,
                 st.wooferlevel
             )]
         }
@@ -337,7 +450,7 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"nightmode":{}}}}}"#,
+                r#"{{"msg":"NIGHT_MODE_SET","result":"OK","data":{{"nightmode":{}}}}}"#,
                 st.nightmode
             )]
         }
@@ -348,8 +461,19 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"autovol":{}}}}}"#,
+                r#"{{"msg":"AUTO_VOL_SET","result":"OK","data":{{"autovol":{}}}}}"#,
                 st.autovol
+            )]
+        }
+        "AUTO_DISPLAY_SET" => {
+            if let Some(d) = data {
+                if let Some(b) = d.get_bool("autodisplay") {
+                    st.autodisplay = b;
+                }
+            }
+            vec![format!(
+                r#"{{"msg":"AUTO_DISPLAY_SET","result":"OK","data":{{"autodisplay":{}}}}}"#,
+                st.autodisplay
             )]
         }
         "DRC_SET" => {
@@ -359,7 +483,7 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"drc":{}}}}}"#,
+                r#"{{"msg":"DRC_SET","result":"OK","data":{{"drc":{}}}}}"#,
                 st.drc
             )]
         }
@@ -370,7 +494,7 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"avsync":{}}}}}"#,
+                r#"{{"msg":"AV_SYNC_SET","result":"OK","data":{{"avsync":{}}}}}"#,
                 st.avsync
             )]
         }
@@ -381,8 +505,19 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"rearboxlevel":{}}}}}"#,
+                r#"{{"msg":"REARBOX_LEVEL_SET","result":"OK","data":{{"rearboxlevel":{}}}}}"#,
                 st.rearboxlevel
+            )]
+        }
+        "ON_SURROUND_SET" => {
+            if let Some(d) = data {
+                if let Some(b) = d.get_bool("rearboxon") {
+                    st.rearboxon = b;
+                }
+            }
+            vec![format!(
+                r#"{{"msg":"ON_SURROUND_SET","result":"OK","data":{{"rearboxon":{}}}}}"#,
+                st.rearboxon
             )]
         }
         "AUTO_POWER_SET" => {
@@ -392,18 +527,18 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"autopower":{}}}}}"#,
+                r#"{{"msg":"AUTO_POWER_SET","result":"OK","data":{{"autopower":{}}}}}"#,
                 st.autopower
             )]
         }
         "LED_SET" => {
             if let Some(d) = data {
-                if let Some(b) = d.get_bool("ledset") {
+                if let Some(b) = d.get_bool("stat").or_else(|| d.get_bool("ledset")) {
                     st.ledset = b;
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"ledset":{}}}}}"#,
+                r#"{{"msg":"LED_SET","result":"OK","data":{{"stat":{}}}}}"#,
                 st.ledset
             )]
         }
@@ -414,18 +549,18 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"tvremote":{}}}}}"#,
+                r#"{{"msg":"TV_REMOTE_SET","result":"OK","data":{{"tvremote":{}}}}}"#,
                 st.tvremote
             )]
         }
         "BT_STANDBY_SET" => {
             if let Some(d) = data {
-                if let Some(b) = d.get_bool("btstandby") {
+                if let Some(b) = d.get_bool("on").or_else(|| d.get_bool("btstandby")) {
                     st.btstandby = b;
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"btstandby":{}}}}}"#,
+                r#"{{"msg":"BT_STANDBY_SET","result":"OK","data":{{"on":{}}}}}"#,
                 st.btstandby
             )]
         }
@@ -436,18 +571,18 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"SETTING_INFO","result":"ok","data":{{"limit_bt_conn":{}}}}}"#,
+                r#"{{"msg":"BT_LIMIT_SET","result":"OK","data":{{"limit_bt_conn":{}}}}}"#,
                 st.limit_bt_conn
             )]
         }
         "SLEEP_SET" => {
             if let Some(d) = data {
                 if let Some(v) = d.get_i64("time") {
-                    st.sleeptime = v;
+                    st.sleeptime = v.max(0);
                 }
             }
             vec![format!(
-                r#"{{"msg":"SLEEP_INFO","result":"ok","data":{{"time":{}}}}}"#,
+                r#"{{"msg":"SLEEP_SET","result":"OK","data":{{"time":{}}}}}"#,
                 st.sleeptime
             )]
         }
@@ -501,19 +636,38 @@ fn build_sim_replies(
                 }
             }
             vec![format!(
-                r#"{{"msg":"ALARM_INFO","result":"ok","data":{{"alarmlist":{},"mode":0,"result":0}}}}"#,
+                r#"{{"msg":"ALARM_SET","result":"OK","data":{{"info":{}}}}}"#,
                 st.alarms_json()
             )]
         }
         "SET_ALARM_PLAYLIST" => vec![
-            r#"{"msg":"SET_ALARM_PLAYLIST","result":"ok","data":{"result":0}}"#.to_string(),
+            r#"{"msg":"SET_ALARM_PLAYLIST","result":"OK","data":{"index":0}}"#.to_string(),
         ],
-        "SHARE_HOME_INFO" => vec![
-            r#"{"msg":"SHARE_HOME_INFO","result":"ok","data":{"result":0,"status":"ok"}}"#.to_string(),
-        ],
-        "SPK_ADD_SET" => vec![
-            r#"{"msg":"SPK_ADD_RESULT","result":"ok","data":{"error_code":0,"result":0}}"#.to_string(),
-        ],
-        _ => vec![format!(r#"{{"msg":{},"result":"ok"}}"#, json_str(msg))],
+        "SHARE_HOME_INFO" => {
+            if let Some(d) = data {
+                if let Some(ssid) = d.get_str("ssid") {
+                    st.ssid = ssid.to_string();
+                }
+            }
+            vec![format!(
+                r#"{{"msg":"SHARE_HOME_INFO","result":"OK","data":{{"ssid":{}}}}}"#,
+                json_str(&st.ssid)
+            )]
+        }
+        "SPK_ADD_SET" | "SPK_INFO_MODIFY" => {
+            if let Some(d) = data {
+                if let Some(name) = d.get_str("name") {
+                    if !name.trim().is_empty() {
+                        st.name = name.trim().to_string();
+                    }
+                }
+            }
+            vec![format!(
+                r#"{{"msg":{},"result":"OK","data":{{"name":{},"reg":true}}}}"#,
+                json_str(msg),
+                json_str(&st.name)
+            )]
+        }
+        _ => vec![format!(r#"{{"msg":{},"result":"OK"}}"#, json_str(msg))],
     }
 }

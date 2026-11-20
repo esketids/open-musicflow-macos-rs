@@ -41,22 +41,23 @@ jobs:
           chmod +x scripts/package-macos-app.sh
           ./scripts/package-macos-app.sh
           cd release
-          ditto -c -k --sequesterRsrc --keepParent "Open MusicFlow Studio.app" open-musicflow-macos-rs-v1.0.0-universal-app.zip
+          ditto -c -k --sequesterRsrc --keepParent "Open MusicFlow Studio.app" open-musicflow-macos-rs-v1.1.0-universal-app.zip
           mkdir -p dmg-stage
           cp -R "Open MusicFlow Studio.app" dmg-stage/
           cp "Install-to-Applications.command" dmg-stage/
           ln -s /Applications dmg-stage/Applications
-          hdiutil create -volname "Open MusicFlow Studio" -srcfolder dmg-stage -ov -format UDZO Open-MusicFlow-Studio-v1.0.0-macOS-Universal.dmg
-          zip -r open-musicflow-macos-rs-v1.0.0-universal.zip "Open MusicFlow Studio.app" "Install-to-Applications.command"
+          hdiutil create -volname "Open MusicFlow Studio" -srcfolder dmg-stage -ov -format UDZO Open-MusicFlow-Studio-v1.1.0-macOS-Universal.dmg
+          zip -r open-musicflow-macos-rs-v1.1.0-universal.zip "Open MusicFlow Studio.app" "Install-to-Applications.command"
 
-      - name: Upload macOS Universal .dmg & .zip to GitHub Release v1.0.0
+      - name: Upload macOS Universal .dmg & .zip to GitHub Release v1.1.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload v1.0.0 \
-            release/Open-MusicFlow-Studio-v1.0.0-macOS-Universal.dmg \
-            release/open-musicflow-macos-rs-v1.0.0-universal.zip \
-            release/open-musicflow-macos-rs-v1.0.0-universal-app.zip \
+          gh release view v1.1.0 >/dev/null 2>&1 || gh release create v1.1.0 --title "Open MusicFlow Studio (Rust Edition) v1.1.0" --notes "Automated release for v1.1.0"
+          gh release upload v1.1.0 \
+            release/Open-MusicFlow-Studio-v1.1.0-macOS-Universal.dmg \
+            release/open-musicflow-macos-rs-v1.1.0-universal.zip \
+            release/open-musicflow-macos-rs-v1.1.0-universal-app.zip \
             --clobber || true
 
   build-linux-x64:
@@ -69,20 +70,21 @@ jobs:
         run: |
           cargo test
           cargo build --release
-          mkdir -p release/open-musicflow-rs-v1.0.0-linux-x64
-          cp target/release/open-musicflow-rs release/open-musicflow-rs-v1.0.0-linux-x64/
-          cp README.md docs-sj8-reference.md release/open-musicflow-rs-v1.0.0-linux-x64/
-          cp -r configs scripts release/open-musicflow-rs-v1.0.0-linux-x64/
-          tar -czf release/open-musicflow-rs-v1.0.0-linux-x64.tar.gz -C release open-musicflow-rs-v1.0.0-linux-x64
-          (cd release && zip -r open-musicflow-rs-v1.0.0-linux-x64.zip open-musicflow-rs-v1.0.0-linux-x64)
+          mkdir -p release/open-musicflow-rs-v1.1.0-linux-x64
+          cp target/release/open-musicflow-rs release/open-musicflow-rs-v1.1.0-linux-x64/
+          cp README.md docs-sj8-reference.md release/open-musicflow-rs-v1.1.0-linux-x64/
+          cp -r configs scripts release/open-musicflow-rs-v1.1.0-linux-x64/
+          tar -czf release/open-musicflow-rs-v1.1.0-linux-x64.tar.gz -C release open-musicflow-rs-v1.1.0-linux-x64
+          (cd release && zip -r open-musicflow-rs-v1.1.0-linux-x64.zip open-musicflow-rs-v1.1.0-linux-x64)
 
-      - name: Upload Linux x64 binary to GitHub Release v1.0.0
+      - name: Upload Linux x64 binary to GitHub Release v1.1.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload v1.0.0 \
-            release/open-musicflow-rs-v1.0.0-linux-x64.tar.gz \
-            release/open-musicflow-rs-v1.0.0-linux-x64.zip \
+          gh release view v1.1.0 >/dev/null 2>&1 || gh release create v1.1.0 --title "Open MusicFlow Studio (Rust Edition) v1.1.0" --notes "Automated release for v1.1.0"
+          gh release upload v1.1.0 \
+            release/open-musicflow-rs-v1.1.0-linux-x64.tar.gz \
+            release/open-musicflow-rs-v1.1.0-linux-x64.zip \
             --clobber || true
 
   build-windows-x64:
@@ -95,13 +97,16 @@ jobs:
         run: |
           cargo test
           cargo build --release
-          mkdir -p release/open-musicflow-rs-v1.0.0-windows-x64
-          cp target/release/open-musicflow-rs.exe release/open-musicflow-rs-v1.0.0-windows-x64/OpenMusicFlowStudio.exe
-          cp README.md release/open-musicflow-rs-v1.0.0-windows-x64/
-          cp docs-sj8-reference.md release/open-musicflow-rs-v1.0.0-windows-x64/
-          7z a release/open-musicflow-rs-v1.0.0-windows-x64.zip ./release/open-musicflow-rs-v1.0.0-windows-x64/*
+          mkdir -p release/open-musicflow-rs-v1.1.0-windows-x64
+          cp target/release/open-musicflow-rs.exe release/open-musicflow-rs-v1.1.0-windows-x64/OpenMusicFlowStudio.exe
+          cp README.md release/open-musicflow-rs-v1.1.0-windows-x64/
+          cp docs-sj8-reference.md release/open-musicflow-rs-v1.1.0-windows-x64/
+          7z a release/open-musicflow-rs-v1.1.0-windows-x64.zip ./release/open-musicflow-rs-v1.1.0-windows-x64/*
 
-      - name: Upload Windows x64 .exe to GitHub Release v1.0.0
+      - name: Upload Windows x64 .exe to GitHub Release v1.1.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload v1.0.0 release/open-musicflow-rs-v1.0.0-windows-x64.zip --clobber
+        run: |
+          gh release view v1.1.0 2>$null
+          if ($LASTEXITCODE -ne 0) { gh release create v1.1.0 --title "Open MusicFlow Studio (Rust Edition) v1.1.0" --notes "Automated release for v1.1.0" }
+          gh release upload v1.1.0 release/open-musicflow-rs-v1.1.0-windows-x64.zip --clobber

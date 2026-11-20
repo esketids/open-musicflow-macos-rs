@@ -137,9 +137,9 @@ fn aes256_encrypt_block(block: &[u8; 16], rkeys: &[[u8; 16]; 15]) -> [u8; 16] {
     for i in 0..16 {
         s[i] ^= rkeys[0][i];
     }
-    for round in 1..14 {
-        for i in 0..16 {
-            s[i] = SBOX[s[i] as usize];
+    for rkey in rkeys.iter().take(14).skip(1) {
+        for byte in &mut s {
+            *byte = SBOX[*byte as usize];
         }
         // ShiftRows
         s = [
@@ -158,12 +158,12 @@ fn aes256_encrypt_block(block: &[u8; 16], rkeys: &[[u8; 16]; 15]) -> [u8; 16] {
             s[idx + 3] = gmul(3, s0) ^ s1 ^ s2 ^ gmul(2, s3);
         }
         for i in 0..16 {
-            s[i] ^= rkeys[round][i];
+            s[i] ^= rkey[i];
         }
     }
     // Final round (14)
-    for i in 0..16 {
-        s[i] = SBOX[s[i] as usize];
+    for byte in &mut s {
+        *byte = SBOX[*byte as usize];
     }
     s = [
         s[0], s[5], s[10], s[15],
@@ -190,8 +190,8 @@ fn aes256_decrypt_block(block: &[u8; 16], rkeys: &[[u8; 16]; 15]) -> [u8; 16] {
             s[8], s[5], s[2], s[15],
             s[12], s[9], s[6], s[3],
         ];
-        for i in 0..16 {
-            s[i] = INV_SBOX[s[i] as usize];
+        for byte in &mut s {
+            *byte = INV_SBOX[*byte as usize];
         }
         for i in 0..16 {
             s[i] ^= rkeys[round][i];
@@ -212,8 +212,8 @@ fn aes256_decrypt_block(block: &[u8; 16], rkeys: &[[u8; 16]; 15]) -> [u8; 16] {
         s[8], s[5], s[2], s[15],
         s[12], s[9], s[6], s[3],
     ];
-    for i in 0..16 {
-        s[i] = INV_SBOX[s[i] as usize];
+    for byte in &mut s {
+        *byte = INV_SBOX[*byte as usize];
     }
     for i in 0..16 {
         s[i] ^= rkeys[0][i];
@@ -226,11 +226,11 @@ pub fn encrypt_aes256_cbc(plaintext: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Ve
     let pad_len = 16 - (plaintext.len() % 16);
     let mut padded = Vec::with_capacity(plaintext.len() + pad_len);
     padded.extend_from_slice(plaintext);
-    padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+    padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
 
     let mut out = Vec::with_capacity(padded.len());
     let mut prev = *iv;
-    for chunk in padded.chunks_exact(16) {
+    for chunk in padded.as_chunks::<16>().0 {
         let mut block = [0u8; 16];
         for i in 0..16 {
             block[i] = chunk[i] ^ prev[i];
@@ -243,15 +243,14 @@ pub fn encrypt_aes256_cbc(plaintext: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Ve
 }
 
 pub fn decrypt_aes256_cbc(ciphertext: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Option<Vec<u8>> {
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
         return None;
     }
     let rkeys = expand_key_256(key);
     let mut out = Vec::with_capacity(ciphertext.len());
     let mut prev = *iv;
-    for chunk in ciphertext.chunks_exact(16) {
-        let mut block = [0u8; 16];
-        block.copy_from_slice(chunk);
+    for chunk in ciphertext.as_chunks::<16>().0 {
+        let block = *chunk;
         let mut dec = aes256_decrypt_block(&block, &rkeys);
         for i in 0..16 {
             dec[i] ^= prev[i];
@@ -347,12 +346,12 @@ impl LgPacketFramer {
 
         while !self.buf.is_empty() {
             let first = self.buf[0];
-            if first == LG_MAGIC_ENCRYPTED || first == LG_MAGIC_PLAIN {
+            if first == LG_MAGIC_ENCRYPTED || first == LG_MAGIC_PLAIN || first == 0x11 || first == 0x01 {
                 if self.buf.len() < 5 {
                     break;
                 }
                 let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
-                if len == 0 || len > 512 * 1024 {
+                if len > 512 * 1024 {
                     self.buf.remove(0);
                     continue;
                 }
@@ -361,6 +360,10 @@ impl LgPacketFramer {
                 }
                 let payload = self.buf[5..5 + len].to_vec();
                 self.buf.drain(0..5 + len);
+
+                if (first & 0x0F) == 0x01 || len == 0 {
+                    continue;
+                }
 
                 if first == LG_MAGIC_ENCRYPTED {
                     if let Some((json_text, mode)) = decrypt_lg_payload_auto(&payload) {
@@ -442,7 +445,7 @@ pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -457,7 +460,7 @@ pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
         }
 
         let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for i in 0..80 {
+        for (i, &wi) in w.iter().enumerate() {
             let (f, k) = match i {
                 0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
                 20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
@@ -469,7 +472,7 @@ pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
                 .wrapping_add(f)
                 .wrapping_add(e)
                 .wrapping_add(k)
-                .wrapping_add(w[i]);
+                .wrapping_add(wi);
             e = d;
             d = c;
             c = b.rotate_left(30);
@@ -494,7 +497,7 @@ pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
 
 pub fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
