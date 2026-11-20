@@ -13,9 +13,9 @@ use crate::crypto::{days_list_to_bitmask, websocket_accept_key, EncryptionMode};
 use crate::json::{json_str, parse_json};
 use crate::logger::{debug_log_paths, get_recent_logs_text, log_debug};
 use crate::protocol::{
-    connect_soundbar_tcp, discover_ssdp_multicast, encode_ws_text_frame, probe_soundbar_port,
-    send_one_shot_lg_command, synthesize_wav_track, SoundbarController, WifiAlarmEntry,
-    LG_DEFAULT_TCP_PORT, LG_DMS_HTTP_PORT,
+    connect_soundbar_tcp, detect_local_lan_ip, discover_ssdp_multicast, encode_ws_text_frame,
+    probe_soundbar_port, send_one_shot_lg_command, synthesize_wav_track, SoundbarController,
+    WifiAlarmEntry, LG_DEFAULT_TCP_PORT, LG_DMS_HTTP_PORT,
 };
 use crate::simulator::start_mock_soundbar_server;
 use std::env;
@@ -51,7 +51,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4741);
 
-    log_debug("BOOT", "Starting Open MusicFlow Studio (Native Rust Edition v1.0.0)...");
+    log_debug("BOOT", "Starting Open MusicFlow Studio (Native Rust Edition v1.1.0)...");
     for p in debug_log_paths() {
         log_debug("BOOT", &format!("Debug log file active: {}", p.display()));
     }
@@ -468,9 +468,9 @@ fn handle_http_connection(
                 .and_then(|b| b.get_i64("apPort").or_else(|| b.get_i64("port")))
                 .unwrap_or(9741) as u16;
             let cmd = format!(
-                r#"{{"data":{{"home_ap_security_type":"WPA2","home_ap_ssid":{},"home_ap_ key":{},"bridge__enable":"no"}},"msg":"SHARE_HOME_INFO"}}"#,
-                json_str(ssid),
-                json_str(pwd)
+                r#"{{"data":{{"pwd":{},"ssid":{}}},"msg":"SHARE_HOME_INFO"}}"#,
+                json_str(pwd),
+                json_str(ssid)
             );
             log_debug(
                 "PROVISION",
@@ -498,18 +498,12 @@ fn handle_http_connection(
                 .as_ref()
                 .and_then(|b| b.get_i64("port"))
                 .unwrap_or(9741) as u16;
-            let mac = body_json
-                .as_ref()
-                .and_then(|b| b.get_str("mac"))
-                .unwrap_or("7c:1c:4e:3b:b0:22");
             let name = body_json
                 .as_ref()
                 .and_then(|b| b.get_str("speakerName").or_else(|| b.get_str("name")))
                 .unwrap_or("Sound Bar SJ8");
             let cmd = format!(
-                r#"{{"data":{{"ip":{},"mac":{},"name":{}}},"msg":"SPK_ADD_SET"}}"#,
-                json_str(host),
-                json_str(mac),
+                r#"{{"data":{{"icon":0,"name":{}}},"msg":"SPK_ADD_SET"}}"#,
                 json_str(name)
             );
             log_debug(
@@ -541,11 +535,29 @@ fn handle_http_connection(
                 guard.volume = vol;
                 guard.send_raw_json(
                     &format!(
-                        r#"{{"msg":"VOLUME_SETTING","data":{{"volume":{},"fadetime":{}}}}}"#,
+                        r#"{{"msg":"VOLUME_SETTING","data":{{"vol":{},"fadetime":{}}}}}"#,
                         vol, fade
                     ),
                     None,
                 );
+                guard.broadcast_state();
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
+            }
+        }
+        ("POST", "/api/volume/up") => {
+            if let Ok(mut guard) = controller.lock() {
+                guard.volume = (guard.volume + 1).clamp(0, guard.max_volume);
+                guard.send_raw_json(r#"{"msg":"VOLUME_UP"}"#, None);
+                guard.broadcast_state();
+                let st = guard.soundbar_state_json();
+                send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
+            }
+        }
+        ("POST", "/api/volume/down") => {
+            if let Ok(mut guard) = controller.lock() {
+                guard.volume = (guard.volume - 1).clamp(0, guard.max_volume);
+                guard.send_raw_json(r#"{"msg":"VOLUME_DOWN"}"#, None);
                 guard.broadcast_state();
                 let st = guard.soundbar_state_json();
                 send_json(&mut stream, &format!(r#"{{"ok":true,"state":{},"soundbar":{}}}"#, st, st));
@@ -575,7 +587,7 @@ fn handle_http_connection(
                     .unwrap_or(0);
                 guard.current_function = func;
                 guard.send_raw_json(
-                    &format!(r#"{{"msg":"FUNCTION_SET","data":{{"func":{}}}}}"#, func),
+                    &format!(r#"{{"msg":"FUNCTION_SET","data":{{"type":{}}}}}"#, func),
                     None,
                 );
                 guard.broadcast_state();
@@ -591,7 +603,7 @@ fn handle_http_connection(
                     .unwrap_or(0);
                 guard.current_eq = eq;
                 guard.send_raw_json(
-                    &format!(r#"{{"msg":"EQ_SETTING","data":{{"eq":{}}}}}"#, eq),
+                    &format!(r#"{{"msg":"EQ_SETTING","data":{{"type":0,"value":{}}}}}"#, eq),
                     None,
                 );
                 guard.broadcast_state();
@@ -657,6 +669,13 @@ fn handle_http_connection(
                             None,
                         );
                     }
+                    if let Some(flag) = b.get_bool("rearEnabled") {
+                        guard.rear_enabled = flag;
+                        guard.send_raw_json(
+                            &format!(r#"{{"msg":"ON_SURROUND_SET","data":{{"rearboxon":{}}}}}"#, flag),
+                            None,
+                        );
+                    }
                     if let Some(v) = b.get_i64("rearLevel") {
                         guard.rear_level = v.clamp(-6, 6);
                         guard.send_raw_json(
@@ -708,10 +727,20 @@ fn handle_http_connection(
                             None,
                         );
                     }
+                    if let Some(flag) = b.get_bool("autoDisplay") {
+                        guard.auto_display = flag;
+                        guard.send_raw_json(
+                            &format!(
+                                r#"{{"msg":"AUTO_DISPLAY_SET","data":{{"autodisplay":{}}}}}"#,
+                                flag
+                            ),
+                            None,
+                        );
+                    }
                     if let Some(flag) = b.get_bool("ledIndicator") {
                         guard.led_indicator = flag;
                         guard.send_raw_json(
-                            &format!(r#"{{"msg":"LED_SET","data":{{"ledset":{}}}}}"#, flag),
+                            &format!(r#"{{"msg":"LED_SET","data":{{"stat":{},"ledset":{}}}}}"#, flag, flag),
                             None,
                         );
                     }
@@ -729,8 +758,8 @@ fn handle_http_connection(
                         guard.bt_standby = flag;
                         guard.send_raw_json(
                             &format!(
-                                r#"{{"msg":"BT_STANDBY_SET","data":{{"btstandby":{}}}}}"#,
-                                flag
+                                r#"{{"msg":"BT_STANDBY_SET","data":{{"on":{},"btstandby":{}}}}}"#,
+                                flag, flag
                             ),
                             None,
                         );
@@ -806,6 +835,7 @@ fn handle_http_connection(
                         fade_in_seconds: 15,
                         synced_to_hardware: true,
                     };
+                    let lan_ip = detect_local_lan_ip(&guard.host);
                     let alarm_type = if source_type == "default_chime" { 0 } else { 1 };
                     let songpath = if source_type == "default_chime" {
                         "".to_string()
@@ -813,12 +843,18 @@ fn handle_http_connection(
                         entry.spotify_uri.clone()
                     } else {
                         format!(
-                            "http://127.0.0.1:{}/stream/{}.wav",
-                            LG_DMS_HTTP_PORT, entry.local_track_id
+                            "http://{}:{}/stream/{}.wav",
+                            lan_ip, LG_DMS_HTTP_PORT, entry.local_track_id
                         )
                     };
+                    let ip_field = if source_type == "default_chime" {
+                        ""
+                    } else {
+                        &lan_ip
+                    };
                     let cmd = format!(
-                        r#"{{"msg":"ALARM_SET","data":{{"id":-1,"modifiedid":{},"mode":0,"day":{},"dayrepeat":true,"hour":{},"minute":{},"type":{},"duration":{},"volume":{},"enable":true,"shuffle":{},"title":{},"ipaddress":"","songpath":{}}}}}"#,
+                        r#"{{"msg":"ALARM_SET","data":{{"id":{},"modifiedid":{},"mode":0,"day":{},"dayrepeat":true,"hour":{},"minute":{},"type":{},"duration":{},"volume":{},"enable":true,"shuffle":{},"title":{},"ipaddress":{},"songpath":{}}}}}"#,
+                        entry.id,
                         entry.id,
                         entry.days_bitmask,
                         entry.hour,
@@ -828,6 +864,7 @@ fn handle_http_connection(
                         entry.volume,
                         entry.shuffle,
                         json_str(&entry.title),
+                        json_str(ip_field),
                         json_str(&songpath)
                     );
                     guard.alarms.push(entry);
@@ -881,7 +918,7 @@ fn handle_http_connection(
                     guard.volume = a.volume;
                     guard.send_raw_json(
                         &format!(
-                            r#"{{"msg":"VOLUME_SETTING","data":{{"volume":{},"fadetime":5}}}}"#,
+                            r#"{{"msg":"VOLUME_SETTING","data":{{"vol":{},"fadetime":5}}}}"#,
                             a.volume
                         ),
                         None,
@@ -926,9 +963,14 @@ fn handle_http_connection(
                 .as_ref()
                 .and_then(|b| b.get_str("clientId"))
                 .unwrap_or("lg-musicflow-client");
+            let redirect_uri = body_json
+                .as_ref()
+                .and_then(|b| b.get_str("redirectUri"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("http://127.0.0.1:{}/api/spotify/callback", api_port));
             let auth_url = format!(
-                "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri=http://127.0.0.1:{}/api/spotify/callback&scope=user-read-playback-state%20user-modify-playback-state",
-                cid, api_port
+                "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope=user-read-playback-state%20user-modify-playback-state",
+                cid, redirect_uri
             );
             send_json(
                 &mut stream,
@@ -938,7 +980,7 @@ fn handle_http_connection(
         ("POST", "/api/spotify/transfer") => {
             if let Ok(mut guard) = controller.lock() {
                 guard.current_function = 8;
-                guard.send_raw_json(r#"{"msg":"FUNCTION_SET","data":{"func":8}}"#, None);
+                guard.send_raw_json(r#"{"msg":"FUNCTION_SET","data":{"type":8}}"#, None);
                 guard.broadcast_state();
                 let sp = guard.spotify_state_json();
                 let sb = guard.soundbar_state_json();
@@ -954,15 +996,20 @@ fn handle_http_connection(
                     .as_ref()
                     .and_then(|b| b.get_str("uri"))
                     .unwrap_or("spotify:playlist:37i9dQZF1DXbITWG1ZJKYt");
-                if let Some(title) = body_json.as_ref().and_then(|b| b.get_str("title")) {
-                    guard.play_title = title.to_string();
-                }
+                let title = body_json
+                    .as_ref()
+                    .and_then(|b| b.get_str("title"))
+                    .unwrap_or("Spotify Connect Stream");
+                guard.play_title = title.to_string();
                 guard.current_function = 8;
                 guard.spotify_playing = true;
                 guard.play_playing = true;
+                guard.send_raw_json(r#"{"msg":"FUNCTION_SET","data":{"type":8}}"#, None);
                 guard.send_raw_json(
                     &format!(
-                        r#"{{"msg":"CP_PLAY_URL","data":{{"cp":"spotify","uri":{}}}}}"#,
+                        r#"{{"msg":"CP_PLAY_URL","data":{{"title":{},"artist":"Spotify Connect","album":{},"playing":0,"uri":{}}}}}"#,
+                        json_str(title),
+                        json_str(uri),
                         json_str(uri)
                     ),
                     None,
@@ -976,13 +1023,105 @@ fn handle_http_connection(
                 );
             }
         }
-        ("POST", "/api/spotify/toggle") => {
+        ("POST", "/api/spotify/toggle")
+        | ("POST", "/api/spotify/control")
+        | ("POST", "/api/play-cmd")
+        | ("POST", "/api/spotify/pause")
+        | ("POST", "/api/spotify/stop")
+        | ("POST", "/api/spotify/next")
+        | ("POST", "/api/spotify/prev")
+        | ("POST", "/api/spotify/previous") => {
             if let Ok(mut guard) = controller.lock() {
-                guard.spotify_playing = !guard.spotify_playing;
-                guard.play_playing = guard.spotify_playing;
+                let route_action = match path {
+                    "/api/spotify/pause" => Some("pause"),
+                    "/api/spotify/stop" => Some("stop"),
+                    "/api/spotify/next" => Some("next"),
+                    "/api/spotify/prev" | "/api/spotify/previous" => Some("previous"),
+                    _ => None,
+                };
+                let body_action = body_json.as_ref().and_then(|b| b.get_str("action"));
+                let action = route_action.or(body_action).unwrap_or("toggle");
+                let playctrl_opt = body_json.as_ref().and_then(|b| b.get_i64("playctrl"));
+                let repeat_opt = body_json.as_ref().and_then(|b| b.get_i64("repeat"));
+                let shuffle_opt = body_json.as_ref().and_then(|b| b.get_bool("shuffle"));
+                let time_opt = body_json.as_ref().and_then(|b| b.get_i64("time"));
+
+                if action.eq_ignore_ascii_case("seek") || time_opt.is_some() {
+                    guard.send_seek_cmd(time_opt.unwrap_or(0));
+                } else {
+                    let ctrl = if let Some(c) = playctrl_opt {
+                        c.clamp(0, 8)
+                    } else {
+                        match action.to_ascii_lowercase().as_str() {
+                            "play" | "resume" => 0,
+                            "pause" => 1,
+                            "stop" => 2,
+                            "prev" | "previous" => 3,
+                            "prev_scan" | "rewind" => 4,
+                            "next" => 5,
+                            "next_scan" | "ff" | "fast_forward" => 6,
+                            "repeat" => 7,
+                            "shuffle" => 8,
+                            _ => {
+                                let currently_playing = if guard.connected {
+                                    guard.play_playing
+                                } else {
+                                    guard.spotify_playing
+                                };
+                                if currently_playing { 1 } else { 0 }
+                            }
+                        }
+                    };
+                    guard.send_play_cmd(ctrl, repeat_opt, shuffle_opt);
+                }
                 guard.broadcast_state();
                 let sp = guard.spotify_state_json();
-                send_json(&mut stream, &format!(r#"{{"ok":true,"spotify":{}}}"#, sp));
+                let sb = guard.soundbar_state_json();
+                guard.broadcast_ws("spotify", &sp);
+                send_json(
+                    &mut stream,
+                    &format!(r#"{{"ok":true,"spotify":{},"soundbar":{}}}"#, sp, sb),
+                );
+            }
+        }
+        ("POST", p) if p.starts_with("/api/playback/") => {
+            let action = p.trim_start_matches("/api/playback/");
+            if let Ok(mut guard) = controller.lock() {
+                let repeat_opt = body_json.as_ref().and_then(|b| b.get_i64("repeat"));
+                let shuffle_opt = body_json.as_ref().and_then(|b| b.get_bool("shuffle"));
+                let time_opt = body_json.as_ref().and_then(|b| b.get_i64("time"));
+                if action.eq_ignore_ascii_case("seek") || time_opt.is_some() {
+                    guard.send_seek_cmd(time_opt.unwrap_or(0));
+                } else {
+                    let ctrl = match action.to_ascii_lowercase().as_str() {
+                        "play" | "resume" => 0,
+                        "pause" => 1,
+                        "stop" => 2,
+                        "prev" | "previous" => 3,
+                        "prev_scan" | "rewind" => 4,
+                        "next" => 5,
+                        "next_scan" | "ff" | "fast_forward" => 6,
+                        "repeat" => 7,
+                        "shuffle" => 8,
+                        _ => {
+                            let currently_playing = if guard.connected {
+                                guard.play_playing
+                            } else {
+                                guard.spotify_playing
+                            };
+                            if currently_playing { 1 } else { 0 }
+                        }
+                    };
+                    guard.send_play_cmd(ctrl, repeat_opt, shuffle_opt);
+                }
+                guard.broadcast_state();
+                let sp = guard.spotify_state_json();
+                let sb = guard.soundbar_state_json();
+                guard.broadcast_ws("spotify", &sp);
+                send_json(
+                    &mut stream,
+                    &format!(r#"{{"ok":true,"spotify":{},"soundbar":{}}}"#, sp, sb),
+                );
             }
         }
         ("POST", "/api/media/play") => {
@@ -990,14 +1129,18 @@ fn handle_http_connection(
                 .as_ref()
                 .and_then(|b| b.get_str("trackId"))
                 .unwrap_or("track-sunrise-flac");
-            let url = format!("http://127.0.0.1:{}/stream/{}.wav", api_port, track_id);
             if let Ok(mut guard) = controller.lock() {
+                let lan_ip = detect_local_lan_ip(&guard.host);
+                let url = format!("http://{}:{}/stream/{}.wav", lan_ip, LG_DMS_HTTP_PORT, track_id);
                 guard.current_function = 0;
+                guard.play_playing = true;
                 guard.play_title = track_id.to_string();
                 guard.play_source_app = "MusicFlow DMS (:49252)".to_string();
+                guard.send_raw_json(r#"{"msg":"FUNCTION_SET","data":{"type":0}}"#, None);
                 guard.send_raw_json(
                     &format!(
-                        r#"{{"msg":"LOCAL_PLAY_URL","data":{{"url":{},"title":{}}}}}"#,
+                        r#"{{"msg":"LOCAL_PLAY_URL","data":{{"item":{{"title":{},"artist":"Open MusicFlow Acoustic Lab","uri":{},"albumart":"","source":1,"cptype":0,"objID":{},"genre":"","albumtitle":"Soundbar Reference Suite","duration":6}},"sync":false,"time":0,"add":false,"position":0}}}}"#,
+                        json_str(track_id),
                         json_str(&url),
                         json_str(track_id)
                     ),
@@ -1028,14 +1171,18 @@ fn handle_http_connection(
             let track_id = p
                 .trim_start_matches("/api/media/")
                 .trim_end_matches("/beam");
-            let url = format!("http://127.0.0.1:{}/stream/{}.wav", api_port, track_id);
             if let Ok(mut guard) = controller.lock() {
+                let lan_ip = detect_local_lan_ip(&guard.host);
+                let url = format!("http://{}:{}/stream/{}.wav", lan_ip, LG_DMS_HTTP_PORT, track_id);
                 guard.current_function = 0;
+                guard.play_playing = true;
                 guard.play_title = track_id.to_string();
                 guard.play_source_app = "MusicFlow DMS (:49252)".to_string();
+                guard.send_raw_json(r#"{"msg":"FUNCTION_SET","data":{"type":0}}"#, None);
                 guard.send_raw_json(
                     &format!(
-                        r#"{{"msg":"LOCAL_PLAY_URL","data":{{"url":{},"title":{}}}}}"#,
+                        r#"{{"msg":"LOCAL_PLAY_URL","data":{{"item":{{"title":{},"artist":"Open MusicFlow Acoustic Lab","uri":{},"albumart":"","source":1,"cptype":0,"objID":{},"genre":"","albumtitle":"Soundbar Reference Suite","duration":6}},"sync":false,"time":0,"add":false,"position":0}}}}"#,
+                        json_str(track_id),
                         json_str(&url),
                         json_str(track_id)
                     ),
@@ -1155,26 +1302,56 @@ mod tests {
             assert_eq!(guard.woofer_offset, -15);
             assert_eq!(guard.woofer_raw, 15);
             assert_eq!(guard.woofer_level, 0);
+            assert!(guard.play_playing);
 
             let state_json = guard.soundbar_state_json();
             assert!(state_json.contains("\"availableFunctions\":[0,15,1,12,6,5,8,14]"));
             assert!(state_json.contains("\"availableEqs\":[14,0,7,12]"));
 
+            // APK-conformant schemas: VOLUME_SETTING (vol), EQ_SETTING (type/value), WOOFER_LEVEL_SET, PLAY_CMD
             guard.send_raw_json(
-                r#"{"msg":"VOLUME_SETTING","data":{"volume":24,"fadetime":0}}"#,
+                r#"{"msg":"VOLUME_SETTING","data":{"vol":24,"fadetime":0}}"#,
                 None,
             );
-            guard.send_raw_json(r#"{"msg":"EQ_SETTING","data":{"eq":14}}"#, None);
+            guard.send_raw_json(r#"{"msg":"EQ_SETTING","data":{"type":0,"value":14}}"#, None);
             guard.send_raw_json(r#"{"msg":"WOOFER_LEVEL_SET","data":{"wooferlevel":19}}"#, None);
+            guard.send_raw_json(r#"{"msg":"LED_SET","data":{"stat":false}}"#, None);
+            guard.send_raw_json(r#"{"msg":"ON_SURROUND_SET","data":{"rearboxon":true}}"#, None);
+            guard.send_play_cmd(1, None, None); // PAUSE
         }
 
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(120));
         {
-            let guard = ctrl.lock().unwrap();
+            let mut guard = ctrl.lock().unwrap();
             assert_eq!(guard.volume, 24);
             assert_eq!(guard.current_eq, 14);
             assert_eq!(guard.woofer_raw, 19);
             assert_eq!(guard.woofer_level, 4);
+            assert!(!guard.led_indicator);
+            assert!(guard.rear_enabled);
+            assert!(!guard.play_playing);
+            assert!(!guard.spotify_playing);
+
+            // Resume playback & seek
+            guard.send_play_cmd(0, None, None);
+            guard.send_seek_cmd(77);
+        }
+
+        thread::sleep(Duration::from_millis(120));
+        {
+            let guard = ctrl.lock().unwrap();
+            assert!(guard.play_playing);
+            assert!(guard.spotify_playing);
+            assert_eq!(guard.play_pos_sec, 77);
+        }
+
+        // Verify reconnect generation safety (old reader thread does not clobber connected=true)
+        let ok2 = connect_soundbar_tcp(&ctrl, "127.0.0.1", port, EncryptionMode::Sj8V1, true);
+        assert!(ok2);
+        thread::sleep(Duration::from_millis(120));
+        {
+            let guard = ctrl.lock().unwrap();
+            assert!(guard.connected);
         }
     }
 }

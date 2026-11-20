@@ -121,6 +121,7 @@ pub struct SoundbarController {
     pub play_playing: bool,
     pub play_pos_sec: i64,
     pub play_dur_sec: i64,
+    pub play_repeat: i64,
     pub play_shuffle: bool,
     pub play_codec: String,
 
@@ -132,6 +133,7 @@ pub struct SoundbarController {
     pub spotify_playing: bool,
 
     pub tcp_writer: Option<TcpStream>,
+    pub connection_gen: u64,
     ws_clients: Vec<TcpStream>,
     pkt_counter: u64,
 }
@@ -197,6 +199,7 @@ impl SoundbarController {
             play_playing: true,
             play_pos_sec: 49,
             play_dur_sec: 136,
+            play_repeat: 0,
             play_shuffle: true,
             play_codec: "Spotify Ogg Vorbis 320kbps / 44.1kHz".to_string(),
 
@@ -285,6 +288,7 @@ impl SoundbarController {
             spotify_client_id: "lg-musicflow-open-pkce-client".to_string(),
             spotify_playing: true,
             tcp_writer: None,
+            connection_gen: 0,
             ws_clients: Vec::new(),
             pkt_counter: 0,
         }
@@ -453,21 +457,83 @@ impl SoundbarController {
         );
     }
 
+    pub fn send_play_cmd(
+        &mut self,
+        playctrl: i64,
+        repeat_override: Option<i64>,
+        shuffle_override: Option<bool>,
+    ) {
+        if playctrl == 0 {
+            self.play_playing = true;
+            self.spotify_playing = true;
+        } else if playctrl == 1 || playctrl == 2 {
+            self.play_playing = false;
+            self.spotify_playing = false;
+        }
+
+        let repeat = match repeat_override {
+            Some(r) => r.clamp(0, 2),
+            None if playctrl == 7 => (self.play_repeat + 1) % 3,
+            None => self.play_repeat,
+        };
+        let shuffle = match shuffle_override {
+            Some(s) => s,
+            None if playctrl == 8 => !self.play_shuffle,
+            None => self.play_shuffle,
+        };
+
+        if playctrl == 7 || repeat_override.is_some() {
+            self.play_repeat = repeat;
+        }
+        if playctrl == 8 || shuffle_override.is_some() {
+            self.play_shuffle = shuffle;
+        }
+
+        let payload = format!(
+            r#"{{"msg":"PLAY_CMD","data":{{"playctrl":{},"repeat":{},"shuffle":{}}}}}"#,
+            playctrl, repeat, shuffle
+        );
+        self.send_raw_json(&payload, None);
+    }
+
+    pub fn send_seek_cmd(&mut self, time_sec: i64) {
+        let clamped = time_sec.max(0);
+        self.play_pos_sec = clamped;
+        let payload = format!(
+            r#"{{"msg":"LOCAL_TIME_SEARCH","data":{{"time":{}}}}}"#,
+            clamped
+        );
+        self.send_raw_json(&payload, None);
+    }
+
     pub fn query_initial_sj8_state(&mut self) {
-        let cmds = [
-            r#"{"msg":"PRODUCT_INFO","data":{"day":1,"hour":6,"id":"mac7085C23CCA2A","min":43,"option":0}}"#,
-            r#"{"msg":"RADIO_PART_CONN_GET"}"#,
-            r#"{"msg":"MAC_INFO_REQ"}"#,
-            r#"{"msg":"NET_INFO_REQ"}"#,
-            r#"{"msg":"EQ_INFO_REQ"}"#,
-            r#"{"msg":"SETTING_INFO_REQ"}"#,
-            r#"{"msg":"PLAY_INFO"}"#,
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let days_since_epoch = secs / 86400;
+        // 1970-01-01 was Thursday (index 3 when Mon=0..Sun=6)
+        let lg_day = (days_since_epoch + 3) % 7;
+        let hour = (secs / 3600) % 24;
+        let min = (secs / 60) % 60;
+        let prod_cmd = format!(
+            r#"{{"msg":"PRODUCT_INFO","data":{{"day":{},"hour":{},"id":"mac7085C23CCA2A","min":{},"option":0}}}}"#,
+            lg_day, hour, min
+        );
+        let cmds: [&str; 13] = [
+            &prod_cmd,
+            r#"{"msg":"SYSTEM_VER_REQ"}"#,
+            r#"{"msg":"PLAY_INFO_REQ"}"#,
+            r#"{"msg":"PLAY_TIME_SET","data":{"set":true}}"#,
             r#"{"msg":"FUNC_INFO_REQ"}"#,
-            r#"{"msg":"FUNC_NAME_REQ","data":{"func":15}}"#,
             r#"{"msg":"ALARM_STATE_REQ"}"#,
+            r#"{"msg":"SETTING_INFO_REQ"}"#,
+            r#"{"msg":"FUNC_NAME_REQ","data":{"func":15}}"#,
+            r#"{"msg":"EQ_INFO_REQ"}"#,
             r#"{"msg":"ALARM_LIST_REQ"}"#,
             r#"{"msg":"SLEEP_INFO_REQ"}"#,
-            r#"{"msg":"PLAY_TIME_SET","data":{"enable":true}}"#,
+            r#"{"msg":"NETWORK_INFO_REQ"}"#,
+            r#"{"msg":"CP_INFO_REQ"}"#,
         ];
         for cmd in cmds {
             self.send_raw_json(cmd, None);
@@ -491,6 +557,12 @@ impl SoundbarController {
         if let Some(data) = parsed.get("data") {
             match msg.as_str() {
                 "PRODUCT_INFO" => {
+                    if let Some(s) = data.get_str("modelname") {
+                        self.model_name = s.to_string();
+                    }
+                    if let Some(s) = data.get_str("petname") {
+                        self.pet_name = s.to_string();
+                    }
                     if let Some(info) = data.get("info") {
                         if let Some(s) = info.get_str("name") {
                             self.name = s.to_string();
@@ -501,13 +573,37 @@ impl SoundbarController {
                         if let Some(s) = info.get_str("petname") {
                             self.pet_name = s.to_string();
                         }
-                        if let Some(s) = info.get_str("mac") {
+                        if let Some(s) = info.get_str("wirelessmac").or_else(|| info.get_str("mac")) {
                             self.mac_address = s.to_string();
+                        }
+                        if let Some(s) = info.get_str("btmac") {
+                            self.bt_mac_address = s.to_string();
+                        }
+                        if let Some(s) = info.get_str("bever") {
+                            self.firmware_version = s.to_string();
+                        }
+                        if let Some(v) = info.get_i64("vol") {
+                            if v <= self.max_volume {
+                                self.volume = v;
+                            }
+                        }
+                        if let Some(m) = info.get_bool("mute") {
+                            self.muted = m;
+                        }
+                        if let Some(f) = info.get_i64("function") {
+                            self.current_function = f;
+                        }
+                        if let Some(p) = info.get_bool("playing") {
+                            self.play_playing = p;
+                            self.spotify_playing = p;
+                        }
+                        if let Some(l) = info.get_bool("ledset") {
+                            self.led_indicator = l;
                         }
                     }
                 }
-                "SYSTEM_VER_INFO" => {
-                    if let Some(s) = data.get_str("system") {
+                "SYSTEM_VER_REQ" | "SYSTEM_VER_INFO" => {
+                    if let Some(s) = data.get_str("be").or_else(|| data.get_str("system")) {
                         self.firmware_version = s.to_string();
                     }
                     if let Some(s) = data.get_str("micom") {
@@ -531,21 +627,31 @@ impl SoundbarController {
                         self.mac_address = s.to_string();
                     }
                 }
-                "NET_INFO_DEV" => {
-                    if let Some(s) = data.get_str("ssid") {
+                "NETWORK_INFO_REQ" | "NET_INFO_DEV" | "SHARE_AP_INFO" => {
+                    if let Some(s) = data.get_str("ssid").or_else(|| data.get_str("s_ssid")) {
                         self.ssid = s.to_string();
                     }
                 }
-                "FUNC_INFO" => {
+                "SPK_NAME_CHANGE" => {
+                    if let Some(s) = data.get_str("name") {
+                        if !s.is_empty() {
+                            self.name = s.to_string();
+                        }
+                    }
+                }
+                "FUNC_INFO" | "FUNC_INFO_REQ" => {
                     if let Some(f) = data.get_i64("type") {
                         self.current_function = f;
                     }
                     if let Some(cp) = data.get_i64("cptype") {
                         self.cp_type = cp;
                     }
+                    if let Some(m) = data.get_bool("mute") {
+                        self.muted = m;
+                    }
                 }
-                "EQ_INFO" => {
-                    if let Some(eq) = data.get_i64("eq") {
+                "EQ_INFO" | "EQ_INFO_REQ" | "EQ_NOTI_CHG" => {
+                    if let Some(eq) = data.get_i64("currenteq").or_else(|| data.get_i64("eq")) {
                         self.current_eq = eq;
                     }
                     if let Some(b) = data.get_i64("bass") {
@@ -554,28 +660,49 @@ impl SoundbarController {
                     if let Some(t) = data.get_i64("treble") {
                         self.treble = t;
                     }
-                    if let Some(bal) = data.get_i64("balance") {
+                    if let Some(bal) = data.get_i64("lrbal").or_else(|| data.get_i64("balance")) {
                         self.balance = bal;
                     }
                 }
-                "VOLUME_INFO" | "PLAY_INFO" => {
-                    if let Some(v) = data.get_i64("volume") {
+                "VOLUME_CHANGE" | "VOLUME_INFO" | "VOLUME_SETTING" => {
+                    if let Some(v) = data.get_i64("vol").or_else(|| data.get_i64("volume")) {
+                        self.volume = v;
+                    }
+                    if let Some(m) = data.get_bool("mute") {
+                        self.muted = m;
+                    }
+                }
+                "MUTE_CHANGE" | "MUTE_SET" => {
+                    if let Some(m) = data.get_bool("mute") {
+                        self.muted = m;
+                    }
+                }
+                "PLAY_INFO" | "PLAY_INFO_REQ" | "CP_INFO_REQ" => {
+                    if let Some(v) = data.get_i64("vol").or_else(|| data.get_i64("volume")) {
                         self.volume = v;
                     }
                     if let Some(m) = data.get_bool("mute") {
                         self.muted = m;
                     }
                     if let Some(t) = data.get_str("title") {
-                        self.play_title = t.to_string();
+                        if !t.is_empty() {
+                            self.play_title = t.to_string();
+                        }
                     }
                     if let Some(a) = data.get_str("artist") {
-                        self.play_artist = a.to_string();
+                        if !a.is_empty() {
+                            self.play_artist = a.to_string();
+                        }
                     }
-                    if let Some(al) = data.get_str("album") {
-                        self.play_album = al.to_string();
+                    if let Some(al) = data.get_str("albumtitle").or_else(|| data.get_str("album")) {
+                        if !al.is_empty() {
+                            self.play_album = al.to_string();
+                        }
                     }
-                    if let Some(cp) = data.get_str("cpname") {
-                        self.play_source_app = cp.to_string();
+                    if let Some(cp) = data.get_str("c4aappname").or_else(|| data.get_str("cpname")) {
+                        if !cp.is_empty() {
+                            self.play_source_app = cp.to_string();
+                        }
                     }
                     if let Some(pos) = data.get_i64("position") {
                         self.play_pos_sec = pos;
@@ -583,8 +710,58 @@ impl SoundbarController {
                     if let Some(dur) = data.get_i64("duration") {
                         self.play_dur_sec = dur;
                     }
+                    if let Some(p) = data.get_i64("playing") {
+                        // APK PlayInfoResponse.isPlaying(): 0=NORMAL, 4=BUFFERING
+                        let is_playing = p == 0 || p == 4;
+                        self.play_playing = is_playing;
+                        self.spotify_playing = is_playing;
+                    }
+                    if let Some(rep) = data.get_i64("repeat") {
+                        self.play_repeat = rep;
+                    }
+                    if let Some(shuf) = data.get_bool("shuffle") {
+                        self.play_shuffle = shuf;
+                    }
+                    if let Some(cp) = data.get_i64("cptype") {
+                        self.cp_type = cp;
+                    }
                 }
-                "SETTING_INFO" => {
+                "PLAY_TIME" => {
+                    if let Some(pos) = data.get_i64("position") {
+                        self.play_pos_sec = pos;
+                    }
+                    if let Some(dur) = data.get_i64("duration") {
+                        self.play_dur_sec = dur;
+                    }
+                    if let Some(p) = data.get_i64("playing") {
+                        let is_playing = p == 0 || p == 4;
+                        self.play_playing = is_playing;
+                        self.spotify_playing = is_playing;
+                    }
+                }
+                "PLAY_CMD" => {
+                    if let Some(ctrl) = data.get_i64("playctrl") {
+                        if ctrl == 0 {
+                            self.play_playing = true;
+                            self.spotify_playing = true;
+                        } else if ctrl == 1 || ctrl == 2 {
+                            self.play_playing = false;
+                            self.spotify_playing = false;
+                        }
+                    }
+                    if let Some(rep) = data.get_i64("repeat") {
+                        self.play_repeat = rep;
+                    }
+                    if let Some(shuf) = data.get_bool("shuffle") {
+                        self.play_shuffle = shuf;
+                    }
+                }
+                "LOCAL_TIME_SEARCH" => {
+                    if let Some(t) = data.get_i64("time") {
+                        self.play_pos_sec = t;
+                    }
+                }
+                "SETTING_INFO" | "SETTING_INFO_REQ" | "SETTING_INFO_NOTI" => {
                     if let Some(off) = data.get_i64("wooferoffset") {
                         self.woofer_offset = off;
                     }
@@ -605,10 +782,17 @@ impl SoundbarController {
                         self.av_sync_ms = v;
                     }
                     if let Some(v) = data.get_i64("rearboxlevel") {
-                        self.rear_level = v;
+                        let rear_off = data.get_i64("rearboxoffset").unwrap_or(0);
+                        self.rear_level = v + rear_off;
+                    }
+                    if let Some(b) = data.get_bool("rearboxon") {
+                        self.rear_enabled = b;
                     }
                     if let Some(b) = data.get_bool("autopower") {
                         self.auto_power = b;
+                    }
+                    if let Some(b) = data.get_bool("autodisplay") {
+                        self.auto_display = b;
                     }
                     if let Some(b) = data.get_bool("ledset") {
                         self.led_indicator = b;
@@ -623,18 +807,93 @@ impl SoundbarController {
                         self.bt_restrict = b;
                     }
                 }
-                "ALARM_INFO" => {
-                    if let Some(arr) = data.get_arr("alarmlist") {
+                "NIGHT_MODE_SET" => {
+                    if let Some(b) = data.get_bool("nightmode") {
+                        self.night_mode = b;
+                    }
+                }
+                "AUTO_VOL_SET" => {
+                    if let Some(b) = data.get_bool("autovol") {
+                        self.auto_volume = b;
+                    }
+                }
+                "AUTO_POWER_SET" => {
+                    if let Some(b) = data.get_bool("autopower") {
+                        self.auto_power = b;
+                    }
+                }
+                "AUTO_DISPLAY_SET" => {
+                    if let Some(b) = data.get_bool("autodisplay") {
+                        self.auto_display = b;
+                    }
+                }
+                "DRC_SET" => {
+                    if let Some(b) = data.get_bool("drc") {
+                        self.drc = b;
+                    }
+                }
+                "TV_REMOTE_SET" => {
+                    if let Some(b) = data.get_bool("tvremote") {
+                        self.tv_remote = b;
+                    }
+                }
+                "LED_SET" => {
+                    if let Some(b) = data.get_bool("stat").or_else(|| data.get_bool("ledset")) {
+                        self.led_indicator = b;
+                    }
+                }
+                "BT_STANDBY_SET" | "BT_STANDBY_STATE_NOTI" => {
+                    if let Some(b) = data.get_bool("on").or_else(|| data.get_bool("btstandby")) {
+                        self.bt_standby = b;
+                    }
+                }
+                "BT_LIMIT_SET" | "BT_LIMIT_STATE_NOTI" => {
+                    if let Some(b) = data.get_bool("limit_bt_conn") {
+                        self.bt_restrict = b;
+                    }
+                }
+                "AV_SYNC_SET" => {
+                    if let Some(v) = data.get_i64("avsync") {
+                        self.av_sync_ms = v;
+                    }
+                }
+                "WOOFER_LEVEL_SET" => {
+                    if let Some(w) = data.get_i64("wooferlevel") {
+                        self.woofer_raw = w;
+                        self.woofer_level = w + self.woofer_offset;
+                    }
+                }
+                "REARBOX_LEVEL_SET" => {
+                    if let Some(v) = data.get_i64("rearboxlevel") {
+                        self.rear_level = v;
+                    }
+                }
+                "ON_SURROUND_SET" => {
+                    if let Some(b) = data.get_bool("rearboxon") {
+                        self.rear_enabled = b;
+                    }
+                }
+                "SLEEP_INFO" | "SLEEP_INFO_REQ" | "SLEEP_SET" => {
+                    if let Some(t) = data.get_i64("time") {
+                        self.sleep_timer_minutes = t;
+                    }
+                }
+                "ALARM_INFO" | "ALARM_LIST_REQ" | "ALARM_SET" => {
+                    if let Some(arr) = data.get_arr("info").or_else(|| data.get_arr("alarmlist")) {
                         let mut parsed_alarms = Vec::new();
                         for item in arr {
                             let id = item.get_i64("id").unwrap_or(0);
                             let mask = item.get_i64("day").unwrap_or(124) as u8;
                             let alarm_type = item.get_i64("type").unwrap_or(0);
-                            let songpath = item.get_str("songpath").unwrap_or("").to_string();
-                            let source_type = if alarm_type == 0 || songpath.is_empty() {
-                                "default_chime"
-                            } else if songpath.starts_with("spotify:") {
+                            let songpath = item
+                                .get_str("path")
+                                .or_else(|| item.get_str("songpath"))
+                                .unwrap_or("")
+                                .to_string();
+                            let source_type = if songpath.starts_with("spotify:") {
                                 "spotify"
+                            } else if alarm_type == 0 && songpath.is_empty() {
+                                "default_chime"
                             } else {
                                 "local_stream"
                             };
@@ -673,7 +932,7 @@ impl SoundbarController {
 
     pub fn soundbar_state_json(&self) -> String {
         format!(
-            r#"{{"connected":{},"connecting":false,"host":{},"port":{},"dialect":{},"detectedDialect":"musicflow","encryption":{},"isSimulator":{},"lastUpdated":{},"name":{},"modelName":{},"petName":{},"modelNum":14,"region":"SG","protoVer":1,"registered":true,"firmwareVersion":{},"micomVersion":{},"hdmiVersion":{},"c4aVersion":{},"macAddress":{},"bluetoothMac":{},"btMacAddress":{},"lanMacAddress":{},"ipv4Addr":"192.168.0.10","ipv6Addr":"fe80::7e1c:4eff:fe3b:b022","ssid":{},"rssi":{},"meshChannel":0,"networkMode":5,"networkType":"Wireless","miracast":"off","radioPartStatus":{},"currentFunction":{},"cpType":{},"availableFunctions":[0,15,1,12,6,5,8,14],"supportedFunctions":[0,15,1,12,6,5,8,14],"customFunctionNames":{{"15":"OPTICAL/HDMI ARC"}},"volume":{},"maxVolume":{},"muted":{},"currentEq":{},"availableEqs":[14,0,7,12],"supportedEqs":[14,0,7,12,1,2,3,4,5,6,8,9,10,11,13,15,16,17,18],"bass":{},"treble":{},"lrBalance":{},"balance":{},"nightMode":{},"autoVolume":{},"drc":{},"neuralX":{},"avSyncMs":{},"avSyncMin":0,"avSyncMax":300,"wooferConnected":true,"wooferLevel":{},"wooferRaw":{},"wooferOffset":{},"wooferMin":-15,"wooferMax":6,"rearConnected":false,"rearEnabled":{},"rearLevel":{},"rearMin":-6,"rearMax":6,"centerLevel":{},"topLevel":{},"tvRemote":{},"autoPower":{},"autoDisplay":{},"btStandby":{},"btRestrict":{},"ledIndicator":{},"limitGroupGcast":false,"enableBalance":true,"visibleToneCtrl":true,"visibleAlarm":true,"visibleReserveSleep":true,"visibleMlibSync":false,"visibleTvConn":true,"sleepTimerMinutes":{},"playInfo":{{"playing":{},"isPlaying":{},"title":{},"artist":{},"album":{},"albumArt":"","sourceApp":{},"positionSec":{},"durationSec":{},"repeat":0,"shuffle":{},"cpType":{},"audioFormat":{},"audioCodec":{}}},"alarms":{},"alarmActiveNow":false,"meshNodes":{},"packetLogs":{}}}"#,
+            r#"{{"connected":{},"connecting":false,"host":{},"port":{},"dialect":{},"detectedDialect":"musicflow","encryption":{},"isSimulator":{},"lastUpdated":{},"name":{},"modelName":{},"petName":{},"modelNum":14,"region":"SG","protoVer":1,"registered":true,"firmwareVersion":{},"micomVersion":{},"hdmiVersion":{},"c4aVersion":{},"macAddress":{},"bluetoothMac":{},"btMacAddress":{},"lanMacAddress":{},"ipv4Addr":"192.168.0.10","ipv6Addr":"fe80::7e1c:4eff:fe3b:b022","ssid":{},"rssi":{},"meshChannel":0,"networkMode":5,"networkType":"Wireless","miracast":"off","radioPartStatus":{},"currentFunction":{},"cpType":{},"availableFunctions":[0,15,1,12,6,5,8,14],"supportedFunctions":[0,15,1,12,6,5,8,14],"customFunctionNames":{{"15":"OPTICAL/HDMI ARC"}},"volume":{},"maxVolume":{},"muted":{},"currentEq":{},"availableEqs":[14,0,7,12],"supportedEqs":[14,0,7,12,1,2,3,4,5,6,8,9,10,11,13,15,16,17,18],"bass":{},"treble":{},"lrBalance":{},"balance":{},"nightMode":{},"autoVolume":{},"drc":{},"neuralX":{},"avSyncMs":{},"avSyncMin":0,"avSyncMax":300,"wooferConnected":true,"wooferLevel":{},"wooferRaw":{},"wooferOffset":{},"wooferMin":-15,"wooferMax":6,"rearConnected":false,"rearEnabled":{},"rearLevel":{},"rearMin":-6,"rearMax":6,"centerLevel":{},"topLevel":{},"tvRemote":{},"autoPower":{},"autoDisplay":{},"btStandby":{},"btRestrict":{},"ledIndicator":{},"limitGroupGcast":false,"enableBalance":true,"visibleToneCtrl":true,"visibleAlarm":true,"visibleReserveSleep":true,"visibleMlibSync":false,"visibleTvConn":true,"sleepTimerMinutes":{},"playInfo":{{"playing":{},"isPlaying":{},"title":{},"artist":{},"album":{},"albumArt":"","sourceApp":{},"positionSec":{},"durationSec":{},"repeat":{},"shuffle":{},"cpType":{},"audioFormat":{},"audioCodec":{}}},"alarms":{},"alarmActiveNow":false,"meshNodes":{},"packetLogs":{}}}"#,
             self.connected,
             json_str(&self.host),
             self.port,
@@ -732,6 +991,7 @@ impl SoundbarController {
             json_str(&self.play_source_app),
             self.play_pos_sec,
             self.play_dur_sec,
+            self.play_repeat,
             self.play_shuffle,
             self.cp_type,
             json_str(&self.play_codec),
@@ -743,16 +1003,25 @@ impl SoundbarController {
     }
 
     pub fn spotify_state_json(&self) -> String {
+        let is_playing = if self.connected {
+            self.play_playing
+        } else {
+            self.spotify_playing
+        };
+        let max_vol = if self.max_volume > 0 { self.max_volume } else { 40 };
+        let vol_pct = ((self.volume * 100) + (max_vol / 2)) / max_vol;
         format!(
-            r#"{{"connected":true,"clientId":{},"displayName":"EsDeeKid (Spotify Connect)","email":"musicflow@open-audio.local","product":"premium","activeDeviceId":"lg-sj8-spotify-connect","activeDeviceName":{},"isPlaying":{},"currentTrack":{{"name":{},"artist":{},"album":{},"durationMs":{},"progressMs":{},"uri":"spotify:track:4uLU6hMCjMI75M1A2tKUQC"}},"devices":[{{"id":"lg-sj8-spotify-connect","name":"Sound Bar SJ8 (LG Music Flow TCP 9741)","type":"Speaker","is_active":true,"volume_percent":35,"isSoundbarMatch":true}},{{"id":"lg-sj8-cast","name":"Sound Bar SJ8 (Google Cast C4A)","type":"CastAudio","is_active":false,"volume_percent":35,"isSoundbarMatch":true}}],"playlists":[{{"id":"pl-morning","name":"Morning Acoustic Flow","uri":"spotify:playlist:37i9dQZF1DXbITWG1ZJKYt","trackCount":50,"description":"Gentle acoustic wakeup tracks synced with LG Music Flow Wi-Fi Alarms"}},{{"id":"pl-cinema","name":"Dolby Atmos & Bass Blast Showcase","uri":"spotify:playlist:37i9dQZF1DWZeKCadgRdKQ","trackCount":42,"description":"Deep LFE & spatial surround test tracks for LG SJ8"}},{{"id":"pl-focus","name":"Deep Coding & Hi-Res Instrumental","uri":"spotify:playlist:37i9dQZF1DX4sWSpwq3LiO","trackCount":85,"description":"Ambient piano and electronic textures"}}]}}"#,
+            r#"{{"connected":true,"clientId":{},"displayName":"EsDeeKid (Spotify Connect)","email":"musicflow@open-audio.local","product":"premium","activeDeviceId":"lg-sj8-spotify-connect","activeDeviceName":{},"isPlaying":{},"currentTrack":{{"name":{},"artist":{},"album":{},"durationMs":{},"progressMs":{},"uri":"spotify:track:4uLU6hMCjMI75M1A2tKUQC"}},"devices":[{{"id":"lg-sj8-spotify-connect","name":"Sound Bar SJ8 (LG Music Flow TCP 9741)","type":"Speaker","is_active":true,"volume_percent":{},"isSoundbarMatch":true}},{{"id":"lg-sj8-cast","name":"Sound Bar SJ8 (Google Cast C4A)","type":"CastAudio","is_active":false,"volume_percent":{},"isSoundbarMatch":true}}],"playlists":[{{"id":"pl-morning","name":"Morning Acoustic Flow","uri":"spotify:playlist:37i9dQZF1DXbITWG1ZJKYt","trackCount":50,"description":"Gentle acoustic wakeup tracks synced with LG Music Flow Wi-Fi Alarms"}},{{"id":"pl-cinema","name":"Dolby Atmos & Bass Blast Showcase","uri":"spotify:playlist:37i9dQZF1DWZeKCadgRdKQ","trackCount":42,"description":"Deep LFE & spatial surround test tracks for LG SJ8"}},{{"id":"pl-focus","name":"Deep Coding & Hi-Res Instrumental","uri":"spotify:playlist:37i9dQZF1DX4sWSpwq3LiO","trackCount":85,"description":"Ambient piano and electronic textures"}}]}}"#,
             json_str(&self.spotify_client_id),
             json_str(&self.pet_name),
-            self.spotify_playing,
+            is_playing,
             json_str(&self.play_title),
             json_str(&self.play_artist),
             json_str(&self.play_album),
             self.play_dur_sec * 1000,
-            self.play_pos_sec * 1000
+            self.play_pos_sec * 1000,
+            vol_pct,
+            vol_pct
         )
     }
 
@@ -794,8 +1063,13 @@ pub fn connect_soundbar_tcp(
         Err(_) => return false,
     };
 
-    {
+    let my_gen = {
         if let Ok(mut guard) = controller.lock() {
+            if let Some(old_stream) = guard.tcp_writer.take() {
+                let _ = old_stream.shutdown(std::net::Shutdown::Both);
+            }
+            guard.connection_gen = guard.connection_gen.wrapping_add(1);
+            let gen = guard.connection_gen;
             guard.connected = true;
             guard.host = host.to_string();
             guard.port = port;
@@ -804,8 +1078,11 @@ pub fn connect_soundbar_tcp(
             guard.tcp_writer = Some(stream);
             guard.query_initial_sj8_state();
             guard.broadcast_state();
+            gen
+        } else {
+            return false;
         }
-    }
+    };
 
     let ctrl_clone = Arc::clone(controller);
     thread::spawn(move || {
@@ -818,6 +1095,9 @@ pub fn connect_soundbar_tcp(
             }
             let frames = framer.push(&buf[..n]);
             if let Ok(mut guard) = ctrl_clone.lock() {
+                if guard.connection_gen != my_gen {
+                    break;
+                }
                 for frame in frames {
                     guard.handle_incoming_frame(
                         frame.encrypted,
@@ -829,8 +1109,11 @@ pub fn connect_soundbar_tcp(
             }
         }
         if let Ok(mut guard) = ctrl_clone.lock() {
-            guard.connected = false;
-            guard.broadcast_state();
+            if guard.connection_gen == my_gen {
+                guard.connected = false;
+                guard.tcp_writer = None;
+                guard.broadcast_state();
+            }
         }
     });
 
@@ -845,15 +1128,53 @@ pub fn probe_soundbar_port(host: &str, port: u16, timeout_ms: u64) -> bool {
     }
 }
 
+pub fn detect_local_lan_ip(target_host: &str) -> String {
+    let probe_target = if target_host.is_empty() || target_host == "127.0.0.1" {
+        "192.168.0.10:9741".to_string()
+    } else {
+        format!("{}:9741", target_host)
+    };
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect(&probe_target).is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                let ip = local.ip().to_string();
+                if !ip.starts_with("127.") && ip != "0.0.0.0" {
+                    return ip;
+                }
+            }
+        }
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                let ip = local.ip().to_string();
+                if !ip.starts_with("127.") && ip != "0.0.0.0" {
+                    return ip;
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
 pub fn discover_ssdp_multicast(timeout_ms: u64) -> Vec<(String, String)> {
     let mut results = Vec::new();
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(_) => return results,
     };
+    let _ = sock.set_multicast_ttl_v4(4);
     let _ = sock.set_read_timeout(Some(Duration::from_millis(timeout_ms)));
-    let msearch = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
-    let _ = sock.send_to(msearch.as_bytes(), "239.255.255.250:1900");
+    let targets = [
+        "urn:lge-com:device:MultiroomSpk:1",
+        "urn:schemas-upnp-org:device:MediaRenderer:1",
+        "ssdp:all",
+    ];
+    for st in targets {
+        let msearch = format!(
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {}\r\n\r\n",
+            st
+        );
+        let _ = sock.send_to(msearch.as_bytes(), "239.255.255.250:1900");
+    }
 
     let mut buf = [0u8; 2048];
     while let Ok((n, src)) = sock.recv_from(&mut buf) {
@@ -962,12 +1283,28 @@ pub fn synthesize_wav_track(track_id: &str) -> Vec<u8> {
 }
 
 pub fn iso_timestamp_now() -> String {
-    let secs = SystemTime::now()
+    let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    let millis = dur.subsec_millis();
     let s = secs % 60;
     let m = (secs / 60) % 60;
     let h = (secs / 3600) % 24;
-    format!("2026-11-16T{:02}:{:02}:{:02}.000Z", h, m, s)
+    let days = (secs / 86400) as i64;
+    // Civil date from days since 1970-01-01 (Howard Hinnant algorithm)
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if mo <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year, mo, d, h, m, s, millis
+    )
 }
